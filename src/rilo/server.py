@@ -1,0 +1,538 @@
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from dataclasses import replace
+import asyncio
+import json
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict
+
+from rilo.config import Settings
+from rilo.projects import CAPABILITIES, ProjectCreate, ProjectSettings, ProjectStore, empty_stats
+from rilo.policy_settings import PolicyConfig, policy_catalog
+from rilo.recording import dump_json
+from rilo.runner import Runner, RunConfig, StateConflict
+from rilo.pipeline import PipelineEngine, PipelineStart
+
+
+class InitializeProject(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    preserve_environment: bool = False
+
+
+class ArchiveEpisode(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    archived: bool
+
+
+class DeleteEpisode(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    confirm: bool
+
+
+def create_app(settings: Settings | None = None, *, runner: Runner | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    controller = runner or Runner(settings)
+    projects = ProjectStore(settings.data_dir)
+    active_project_id: str | None = None
+    ownership_lock = asyncio.Lock()
+    retired_controllers: list[Runner] = []
+
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        await pipeline.close()
+        await controller.close()
+
+    app = FastAPI(title="RILO", lifespan=lifespan)
+    app.state.runner = controller
+    app.state.projects = projects
+    web = Path(__file__).parent / "web"
+    app.mount("/static", StaticFiles(directory=web), name="static")
+
+    @app.middleware("http")
+    async def local_controls(request: Request, call_next):
+        if request.method == "POST" and request.url.path.startswith("/api/"):
+            # These are local operator controls. JSON-only + same-origin guards
+            # prevent a random website from submitting commands to localhost.
+            origin = request.headers.get("origin")
+            if origin and urlsplit(origin).netloc != request.url.netloc:
+                return Response('{"detail":"Cross-origin control requests are not allowed"}',
+                                status_code=403, media_type="application/json")
+            if request.headers.get("content-type", "").split(";", 1)[0] != "application/json":
+                return Response('{"detail":"Controls require application/json"}',
+                                status_code=415, media_type="application/json")
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "same-origin"
+        response.headers["X-Frame-Options"] = "DENY"
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.exception_handler(StateConflict)
+    async def state_error(request, exc):
+        return Response(dump_json({"detail": str(exc)}), status_code=409, media_type="application/json")
+
+    def snapshot():
+        return Response(dump_json({**controller.status(), "active_project_id": active_project_id,
+                                   "pipeline_runtime": pipeline.runtime()}), media_type="application/json")
+
+    def require_manual_control():
+        if pipeline.active:
+            raise StateConflict("파이프라인이 실행 권한을 사용 중입니다. 파이프라인 제어에서 Pause/중지를 사용하세요.")
+
+    def runtime():
+        effective = controller.policy_config
+        return {"backend": controller.settings.backend, "suite": controller.settings.suite,
+                "model": effective["model"], "reasoning_effort": effective["reasoning_effort"],
+                "policy": controller.settings.policy, "active_project_id": active_project_id,
+                "phase": controller.phase, "run_id": controller.recorder.run_id if controller.recorder else None}
+
+    def policy_options():
+        return {"models": policy_catalog(), "defaults": {
+            "model": settings.model, "reasoning_effort": settings.reasoning_effort}}
+
+    def project_policy(project):
+        return project.get("policy_config") or policy_options()["defaults"]
+
+    def management_reason(run_id):
+        if pipeline.active and run_id in projects.get(pipeline.runtime()["project_id"])["run_ids"]:
+            return "이 프로젝트의 학습/평가가 실행 중입니다. 파이프라인을 중지한 뒤 데이터를 변경하세요."
+        # A retired provider request can still append its usage to an older run.
+        # Until it settles, avoid destructive changes to any associated files.
+        retired_controllers[:] = [old for old in retired_controllers
+                                   if any(not task.done() for task in old._retired_requests)]
+        if any(not task.done() for owner in (controller, *retired_controllers)
+               for task in owner._retired_requests):
+            return "중단된 GPT 요청의 비용 기록이 도착하는 중입니다. 잠시 후 다시 시도하세요."
+        if controller.recorder and controller.recorder.run_id == run_id:
+            if controller.phase in ("initializing", "ready", "thinking", "executing", "pausing", "paused"):
+                return "현재 실행에 속한 데이터입니다. 수집을 중지하거나 실행이 끝난 뒤 변경할 수 있습니다."
+            if controller._inference is not None and not controller._inference.done():
+                return "GPT 요청이 아직 종료되지 않았습니다. 잠시 후 다시 시도하세요."
+        return None
+
+    def episode_controls(episode):
+        reason = management_reason(episode["run_id"])
+        return {**episode, "can_manage": reason is None, "manage_disabled_reason": reason}
+
+    def get_project(project_id):
+        try:
+            return projects.get(project_id)
+        except KeyError:
+            raise HTTPException(404, "Project does not exist") from None
+
+    def availability(project):
+        reason = None
+        if project["backend"] != settings.backend:
+            reason = f"This server uses {settings.backend}; launch a server configured for {project['backend']} to collect this project."
+        return {"runnable": reason is None, "runnable_reason": reason, "unavailable_reason": reason}
+
+    def project_detail(project_id):
+        result = projects.details(get_project(project_id))
+        status = availability(result["project"])
+        result["project"].update(status)
+        result["project"]["policy_config"] = project_policy(result["project"])
+        result["episodes"] = [episode_controls(ep) for ep in result["episodes"]]
+        result["archived_episodes"] = [episode_controls(ep) for ep in result["archived_episodes"]]
+        return {**result, **status, "runtime": runtime(), "capabilities": CAPABILITIES,
+                "policy_options": policy_options()}
+
+    def require_owner(project_id):
+        get_project(project_id)
+        if project_id != active_project_id:
+            raise StateConflict("This project does not own the active collection. Initialize it first.")
+
+    def link_current(project_id):
+        if project_id and controller.recorder:
+            projects.link_run(project_id, controller.recorder.run_id)
+
+    @app.get("/")
+    async def index():
+        return FileResponse(web / "workspace.html")
+
+    @app.get("/console")
+    async def console():
+        return FileResponse(web / "index.html")
+
+    @app.get("/api/status")
+    async def status():
+        return snapshot()
+
+    @app.get("/api/health")
+    async def health():
+        return {"ok": True, "backend": controller.settings.backend}
+
+    @app.get("/api/tasks")
+    async def tasks(suite: str | None = None):
+        try:
+            selected = suite or controller.settings.suite
+            if selected == controller.settings.suite or controller.settings.backend != "libero":
+                result = await controller.tasks()
+            else:
+                from rilo.adapters.libero import LiberoAdapter
+                def catalog():
+                    adapter = LiberoAdapter(suite=selected, image_size=settings.image_size)
+                    try:
+                        return adapter.list_tasks()
+                    finally:
+                        adapter.close()
+                result = await controller._env(catalog)
+            if controller.settings.backend == "libero":
+                from rilo.adapters.libero import RESET_DRAWER_TASKS
+                result = [{**task, "agent_reset_supported": task.get("name") in RESET_DRAWER_TASKS} for task in result]
+            return {"suite": selected, "tasks": result}
+        except Exception as exc:
+            raise HTTPException(503, controller._safe_error(exc)) from None
+
+    @app.get("/api/workspace")
+    async def workspace():
+        cards = []
+        totals = {"projects": 0, **empty_stats()}
+        for project in projects.list():
+            card = projects.details(project)["project"]
+            card.update(availability(card))
+            card["policy_config"] = project_policy(card)
+            cards.append(card)
+            for key in card["stats"]:
+                totals[key] += card["stats"][key]
+        totals["projects"] = len(cards)
+        return {"projects": cards, "totals": totals, "runtime": runtime(), "capabilities": CAPABILITIES,
+                "pipeline_runtime": pipeline.runtime(),
+                "policy_options": policy_options()}
+
+    @app.get("/api/policy-options")
+    async def policies():
+        return policy_options()
+
+    @app.post("/api/projects", status_code=201)
+    async def create_project(data: ProjectCreate):
+        project = projects.create(data)
+        return {"project": project_detail(project["id"])["project"]}
+
+    @app.get("/api/projects/{project_id}")
+    async def project(project_id: str):
+        return project_detail(project_id)
+
+    @app.post("/api/projects/{project_id}/settings")
+    async def project_settings(project_id: str, data: ProjectSettings):
+        get_project(project_id)
+        projects.update(project_id, data)
+        return {"project": project_detail(project_id)["project"]}
+
+    @app.get("/api/projects/{project_id}/episodes/{run_id}/{episode_id}/detail")
+    async def episode_detail(project_id: str, run_id: str, episode_id: str,
+                             offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100)):
+        try:
+            result = projects.episode_detail(project_id, run_id, episode_id, offset=offset, limit=limit)
+        except (KeyError, FileNotFoundError):
+            raise HTTPException(404, "Episode does not exist in this project") from None
+        except ValueError as exc:
+            raise HTTPException(400, controller._safe_error(exc)) from None
+        result["episode"] = episode_controls(result["episode"])
+        return result
+
+    @app.post("/api/projects/{project_id}/episodes/{run_id}/{episode_id}/archive")
+    async def archive_episode(project_id: str, run_id: str, episode_id: str, data: ArchiveEpisode):
+        async with ownership_lock:
+            reason = management_reason(run_id)
+            if reason:
+                raise StateConflict(reason)
+            try:
+                projects.archive_episode(project_id, run_id, episode_id, archived=data.archived)
+            except (KeyError, FileNotFoundError):
+                raise HTTPException(404, "Episode does not exist in this project") from None
+            except ValueError as exc:
+                raise HTTPException(400, controller._safe_error(exc)) from None
+            return project_detail(project_id)
+
+    @app.post("/api/projects/{project_id}/episodes/{run_id}/{episode_id}/delete")
+    async def delete_episode(project_id: str, run_id: str, episode_id: str, data: DeleteEpisode):
+        if not data.confirm:
+            raise HTTPException(400, "Permanent deletion requires confirm=true")
+        async with ownership_lock:
+            reason = management_reason(run_id)
+            if reason:
+                raise StateConflict(reason)
+            try:
+                projects.delete_episode(project_id, run_id, episode_id)
+            except (KeyError, FileNotFoundError):
+                raise HTTPException(404, "Episode does not exist in this project") from None
+            except ValueError as exc:
+                raise HTTPException(400, controller._safe_error(exc)) from None
+            except OSError:
+                raise HTTPException(500, "Deletion could not finish. Some files may remain; retry this deletion to complete cleanup.") from None
+            if controller.recorder and controller.recorder.run_id == run_id:
+                controller.recorder.exclude_episode(episode_id)
+            return {**project_detail(project_id), "deleted": True}
+
+    @app.post("/api/projects/{project_id}/initialize")
+    async def initialize_project(project_id: str, request: InitializeProject):
+        require_manual_control()
+        return await initialize_owned_project(project_id, request)
+
+    async def initialize_owned_project(project_id, request, *, config_override=None,
+                                       policy_override=None, recording_metadata=None, pipeline_owned=False):
+        nonlocal controller, active_project_id
+        async with ownership_lock:
+            if not pipeline_owned:
+                require_manual_control()
+            project = get_project(project_id)
+            state = availability(project)
+            if not state["runnable"]:
+                raise StateConflict(state["unavailable_reason"])
+            active = controller.phase in ("initializing", "ready", "thinking", "executing", "pausing", "paused")
+            if active and active_project_id != project_id:
+                raise StateConflict("Stop the current collection before initializing a different project.")
+            if controller.phase in ("initializing", "thinking", "executing", "pausing"):
+                raise StateConflict("Pause or stop the current collection before initializing an environment.")
+            if request.preserve_environment and active_project_id != project_id:
+                raise StateConflict("Only this project's verified GPT reset can be continued.")
+            config = RunConfig.model_validate({**project["run_config"], **(config_override or {}), "task_id": project["task_id"]})
+            change_suite = project["suite"] != controller.settings.suite
+            if change_suite and request.preserve_environment:
+                raise StateConflict("Continuing a GPT reset cannot change the environment suite.")
+            try:
+                if change_suite:
+                    if runner is not None:
+                        raise StateConflict("The injected controller does not support changing its environment suite.")
+                    await controller.close()
+                    if any(not task.done() for task in controller._retired_requests):
+                        retired_controllers.append(controller)
+                    controller = Runner(replace(settings, suite=project["suite"], task_id=project["task_id"]))
+                    app.state.runner = controller
+                if not request.preserve_environment:
+                    active_project_id = None
+                policy_config = (PolicyConfig.model_validate(project["policy_config"])
+                                 if project.get("policy_config") else None)
+                await controller.initialize(config, preserve_environment=request.preserve_environment,
+                                            policy_config=policy_config, policy_override=policy_override,
+                                            recording_metadata=recording_metadata)
+                active_project_id = project_id
+                link_current(project_id)
+            except StateConflict:
+                raise
+            except Exception as exc:
+                raise HTTPException(503, controller._safe_error(exc)) from None
+            return snapshot()
+
+    @app.post("/api/projects/{project_id}/start")
+    @app.post("/api/projects/{project_id}/resume")
+    async def start_project(project_id: str):
+        async with ownership_lock:
+            require_manual_control()
+            require_owner(project_id)
+            return await begin()
+
+    @app.post("/api/projects/{project_id}/step")
+    async def step_project(project_id: str):
+        async with ownership_lock:
+            require_manual_control()
+            require_owner(project_id)
+            return await begin(single=True)
+
+    @app.post("/api/projects/{project_id}/pause")
+    async def pause_project(project_id: str):
+        if pipeline.active:
+            await pipeline.pause(project_id)
+            return snapshot()
+        async with ownership_lock:
+            require_owner(project_id)
+            await controller.pause()
+            return snapshot()
+
+    @app.post("/api/projects/{project_id}/stop")
+    async def stop_project(project_id: str):
+        if pipeline.active:
+            await pipeline.stop(project_id)
+            return snapshot()
+        async with ownership_lock:
+            require_owner(project_id)
+            await controller.stop()
+            return snapshot()
+
+    @app.get("/api/media/{filename}")
+    async def media(filename: str):
+        try:
+            path = projects.media_path(filename)
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(404, "Recorded media not found") from None
+        return FileResponse(path)
+
+    @app.get("/api/frame/{camera}")
+    async def frame(camera: str):
+        data = controller.frames.get(camera)
+        if data is None:
+            raise HTTPException(404, "Camera is not available. Initialize the environment first.")
+        return Response(data, media_type="image/jpeg")
+
+    @app.post("/api/initialize")
+    async def initialize(config: RunConfig):
+        nonlocal active_project_id
+        async with ownership_lock:
+            require_manual_control()
+            try:
+                active_project_id = None
+                await controller.initialize(config)
+            except StateConflict:
+                raise
+            except Exception as exc:
+                raise HTTPException(503, controller._safe_error(exc)) from None
+            return snapshot()
+
+    async def begin(single=False):
+        require_manual_control()
+        try:
+            await controller.start(single=single)
+        except StateConflict:
+            raise
+        except Exception as exc:
+            raise HTTPException(400, controller._safe_error(exc)) from None
+        return snapshot()
+
+    @app.post("/api/start")
+    async def start():
+        async with ownership_lock:
+            return await begin()
+
+    @app.post("/api/continue")
+    async def continue_run(config: RunConfig):
+        async with ownership_lock:
+            require_manual_control()
+            project_config = get_project(active_project_id).get("policy_config") if active_project_id else None
+            await controller.initialize(config, preserve_environment=True,
+                policy_config=PolicyConfig.model_validate(project_config) if project_config else None)
+            link_current(active_project_id)
+            return snapshot()
+
+    @app.post("/api/resume")
+    async def resume():
+        async with ownership_lock:
+            return await begin()
+
+    @app.post("/api/step")
+    async def step():
+        async with ownership_lock:
+            return await begin(single=True)
+
+    @app.post("/api/pause")
+    async def pause():
+        if pipeline.active:
+            await pipeline.pause(pipeline.runtime()["project_id"])
+            return snapshot()
+        await controller.pause()
+        return snapshot()
+
+    @app.post("/api/stop")
+    async def stop():
+        if pipeline.active:
+            await pipeline.stop(pipeline.runtime()["project_id"])
+            return snapshot()
+        async with ownership_lock:
+            await controller.stop()
+            return snapshot()
+
+    @app.post("/api/reset")
+    async def reset():
+        async with ownership_lock:
+            require_manual_control()
+            try:
+                project_config = get_project(active_project_id).get("policy_config") if active_project_id else None
+                await controller.initialize(controller.config,
+                    policy_config=PolicyConfig.model_validate(project_config) if project_config else None)
+                link_current(active_project_id)
+            except Exception as exc:
+                raise HTTPException(503, controller._safe_error(exc)) from None
+            return snapshot()
+
+    @app.get("/api/runs")
+    async def runs():
+        results = []
+        if settings.data_dir.exists():
+            for path in sorted(settings.data_dir.glob("*/manifest.json"), reverse=True)[:100]:
+                try:
+                    results.append(projects.read_run(path.parent.name))
+                except (OSError, ValueError, KeyError):
+                    continue
+        return {"runs": results}
+
+    async def prepare_pipeline_run(project_id, episodes, task_policy, metadata, budget):
+        project = get_project(project_id)
+        preserve = bool(active_project_id == project_id and controller.stage == "reset"
+                        and controller.observation and controller.observation.success
+                        and controller.phase in ("completed", "paused")
+                        and controller.config.task_id == project["task_id"]
+                        and controller.config.seed == project["run_config"]["seed"])
+        # Initial setup is allowed only before this project has performed any
+        # movement. Every subsequent pipeline rollout must use a verified reset.
+        same_scene = active_project_id == project_id and controller.observation is not None
+        moved = controller.stats.get("total_steps", 0) > 0
+        if same_scene and moved and not preserve:
+            raise StateConflict("검증된 GPT reset이 없어 자동 실행을 멈췄습니다. 환경을 수동 복구한 뒤 다시 시작하세요.")
+        overrides = {"episodes": episodes, "reset_mode": "agent", "budget_usd": budget}
+        if task_policy is not None:
+            overrides["max_decisions"] = project["run_config"]["max_steps"]
+        await initialize_owned_project(project_id, InitializeProject(preserve_environment=preserve),
+            config_override=overrides, policy_override=task_policy, recording_metadata=metadata, pipeline_owned=True)
+        return controller
+
+    pipeline = PipelineEngine(settings, projects, lambda: controller, prepare_pipeline_run)
+    app.state.pipeline = pipeline
+
+    @app.get("/api/projects/{project_id}/pipeline")
+    async def pipeline_view(project_id: str):
+        get_project(project_id)
+        return pipeline.view(project_id)
+
+    @app.post("/api/projects/{project_id}/pipeline/config")
+    async def pipeline_config(project_id: str, data: dict):
+        get_project(project_id)
+        try:
+            return pipeline.configure(project_id, data)
+        except StateConflict:
+            raise
+        except (ValueError, ImportError) as exc:
+            raise HTTPException(422, controller._safe_error(exc)) from None
+
+    @app.post("/api/projects/{project_id}/pipeline/start")
+    async def pipeline_start(project_id: str, data: PipelineStart):
+        get_project(project_id)
+        async with ownership_lock:
+            try:
+                return await pipeline.start(project_id, data)
+            except StateConflict:
+                raise
+            except (ValueError, ImportError) as exc:
+                raise HTTPException(422, controller._safe_error(exc)) from None
+
+    @app.post("/api/projects/{project_id}/pipeline/pause")
+    async def pipeline_pause(project_id: str):
+        await pipeline.pause(project_id)
+        return pipeline.view(project_id)
+
+    @app.post("/api/projects/{project_id}/pipeline/resume")
+    async def pipeline_resume(project_id: str):
+        await pipeline.resume(project_id)
+        return pipeline.view(project_id)
+
+    @app.post("/api/projects/{project_id}/pipeline/stop")
+    async def pipeline_stop(project_id: str):
+        await pipeline.stop(project_id)
+        return pipeline.view(project_id)
+
+    @app.get("/api/projects/{project_id}/models/{model_id}/checkpoint")
+    async def model_checkpoint(project_id: str, model_id: str):
+        get_project(project_id)
+        try:
+            path = pipeline.checkpoint(project_id, model_id)
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(404, "Model checkpoint not found") from None
+        return FileResponse(path, filename=f"{model_id}.pt", media_type="application/octet-stream")
+
+    return app

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="RILO live robot experimentation console">
+    <title>RILO Console</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23151b20'/%3E%3Cpath d='M8 23V9h8a5 5 0 0 1 0 10H8m8 0 7 4' fill='none' stroke='%23e5b66b' stroke-width='3'/%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="RILO Console home">
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M8 24V8h9a5 5 0 0 1 0 10H8m9 0 7 6"/></svg></span>
+        <span>RILO <span class="brand-sub">/ console</span></span>
+      </a>
+      <div class="topbar-meta">
+        <span class="tag" id="backend-label">Environment —</span>
+        <span class="connection" id="connection"><span class="status-dot"></span><span id="connection-label">Connecting</span></span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="page-heading">
+        <div><p class="eyebrow">AUTONOMOUS ROBOT EXPERIMENTS</p><h1>Watch the loop.</h1><p class="subtitle">Observe, decide, execute. One step at a time.</p></div>
+        <div class="phase-card" role="status" aria-live="polite"><span class="phase-dot" id="phase-dot"></span><div><span class="meta-label">RUN STATE</span><strong id="phase-label">Waiting for server</strong></div></div>
+      </section>
+
+      <div class="notice warning" id="key-notice" hidden><strong>OpenAI API key is not configured.</strong><span>Set <code>OPENAI_API_KEY</code> on the server and restart it. You can still initialize the environment and inspect its cameras.</span></div>
+      <div class="notice info" id="demo-notice" hidden><strong>Demo environment</strong><span>This is a lightweight test environment, not LIBERO or a physical robot.</span></div>
+      <div class="notice danger" id="error-notice" role="alert" hidden><strong id="error-title">Request failed</strong><span id="error-text"></span><button class="icon-button" id="dismiss-error" type="button" aria-label="Dismiss request error">×</button></div>
+
+      <div class="main-grid">
+        <div class="left-column">
+          <section class="panel observation-panel">
+            <div class="panel-heading"><div><span class="section-index">01</span><h2>Observation</h2></div><span class="freshness" id="observation-age">No observation yet</span></div>
+            <div class="camera-grid" id="camera-grid">
+              <div class="camera-placeholder"><svg viewBox="0 0 48 48" aria-hidden="true"><rect x="8" y="14" width="32" height="24" rx="4"/><circle cx="24" cy="26" r="7"/><path d="m16 14 3-5h10l3 5"/></svg><strong>The environment is ready when you are.</strong><span>Choose a task and initialize to load the camera views.</span></div>
+            </div>
+            <div class="observation-footer"><span id="observation-id">OBS —</span><span id="observation-result">Awaiting environment</span></div>
+          </section>
+
+          <section class="panel task-panel">
+            <div class="panel-heading"><div><span class="section-index">02</span><h2 id="objective-label">Current task</h2></div><div class="objective-tags"><span class="tag" id="stage-label">TASK</span><span class="tag" id="episode-label">EPISODE —</span></div></div>
+            <p class="task-instruction" id="task-instruction">Initialize an environment to see the task instruction.</p>
+            <div class="metrics">
+              <div><span class="meta-label">CONTROL STEPS</span><strong id="steps-value">—</strong><div class="progress-track"><span id="steps-progress"></span></div></div>
+              <div><span class="meta-label">POLICY DECISIONS</span><strong id="decisions-value">—</strong><div class="progress-track"><span id="decisions-progress"></span></div></div>
+              <div><span class="meta-label">VERIFIED SUCCESSES</span><strong id="successes-value">—</strong><span class="metric-hint" id="episodes-value">No completed episodes</span></div>
+            </div>
+          </section>
+
+          <section class="panel decision-panel">
+            <div class="panel-heading"><div><span class="section-index">03</span><h2>Agent decision</h2></div><span class="tag" id="decision-status">WAITING</span></div>
+            <p class="decision-note" id="decision-note">The next decision will appear here with its requested actions.</p>
+            <div class="action-list" id="action-list"></div>
+            <div class="detail-grid">
+              <details><summary>Measured state <span>JSON</span></summary><pre id="state-json">No observation yet.</pre></details>
+              <details><summary>Execution receipt <span>JSON</span></summary><pre id="receipt-json">No action executed yet.</pre></details>
+            </div>
+          </section>
+        </div>
+
+        <aside class="right-column">
+          <section class="panel controls-panel">
+            <div class="panel-heading"><div><h2>Run controls</h2></div><span class="keyboard-hint" title="Space pauses or resumes when you are not editing a field">SPACE</span></div>
+            <form id="run-form">
+              <label for="task-select">Task <span id="suite-label">—</span></label>
+              <select id="task-select" name="task_id"><option value="0">Loading task catalog…</option></select>
+              <p class="field-hint" id="task-description">Tasks are provided by the environment adapter.</p>
+              <div class="catalog-error" id="catalog-error" hidden><span id="catalog-error-text"></span><button type="button" id="retry-tasks">Retry catalog</button></div>
+              <div class="form-grid">
+                <div><label for="seed">Seed</label><input id="seed" name="seed" type="number" value="0" min="0" max="2147473648" step="1" required></div>
+                <div><label for="episodes">Episodes</label><input id="episodes" name="episodes" type="number" value="1" min="1" max="100" step="1" required></div>
+                <div><label for="max-steps">Max steps / episode</label><input id="max-steps" name="max_steps" type="number" value="300" min="1" max="10000" step="1" required></div>
+                <div><label for="max-decisions">Max decisions / episode</label><input id="max-decisions" name="max_decisions" type="number" value="50" min="1" max="1000" step="1" required></div>
+              </div>
+              <details class="run-options">
+                <summary>Reset &amp; cost limits</summary>
+                <div class="form-grid">
+                  <div><label for="reset-mode">After each task</label><select id="reset-mode" name="reset_mode"><option value="agent">GPT arm reset</option><option value="environment">Environment reset</option></select></div>
+                  <div><label for="budget-usd">Run budget / USD</label><input id="budget-usd" name="budget_usd" type="number" value="15" min="0.01" max="1000" step="0.01" required></div>
+                  <div><label for="max-reset-steps">Max reset steps</label><input id="max-reset-steps" name="max_reset_steps" type="number" value="300" min="1" max="10000" step="1" required></div>
+                  <div><label for="max-reset-decisions">Max reset decisions</label><input id="max-reset-decisions" name="max_reset_decisions" type="number" value="40" min="1" max="1000" step="1" required></div>
+                </div>
+              </details>
+              <p class="field-hint reset-mode-hint" id="reset-mode-hint">GPT restores the scene using robot actions after each task.</p>
+              <button class="button secondary full-width" id="initialize-button" type="submit" disabled><span aria-hidden="true">↻</span> <span id="initialize-label">Initialize environment</span></button>
+            </form>
+            <div class="control-divider"></div>
+            <div class="transport-grid">
+              <button class="button primary" id="start-button" type="button" disabled><span aria-hidden="true">▶</span> <span id="start-label">Start run</span></button>
+              <button class="button pause" id="pause-button" type="button" disabled><span aria-hidden="true">Ⅱ</span> Pause</button>
+              <button class="button secondary" id="step-button" type="button" disabled><span aria-hidden="true">▹│</span> One decision</button>
+              <button class="button stop" id="stop-button" type="button" disabled><span aria-hidden="true">■</span> Stop run</button>
+            </div>
+            <button class="button text-button full-width" id="reset-button" type="button" disabled>Hard reset environment</button>
+            <p class="control-message" id="control-message" role="status" aria-live="polite">Initialize the environment before starting.</p>
+            <p class="control-help">Pause applies during task execution and GPT reset. It stops after the current control tick; an in-progress environment reset must finish first. One decision runs one action chunk, then pauses. Hard reset discards the current scene.</p>
+          </section>
+
+          <section class="panel session-panel">
+            <div class="panel-heading"><div><h2>Session</h2></div><span class="subtle-dot" aria-hidden="true"></span></div>
+            <dl class="session-details">
+              <div><dt>Policy</dt><dd id="policy-label">—</dd></div>
+              <div><dt>Model</dt><dd id="model-label">—</dd></div>
+              <div><dt>Run ID</dt><dd id="run-id">—</dd></div>
+              <div class="cost-row"><dt>Estimated API cost</dt><dd id="cost-value">—</dd></div>
+              <div><dt>Input / output tokens</dt><dd id="tokens-value">—</dd></div>
+              <div><dt>Cached / reasoning tokens</dt><dd id="token-details-value">—</dd></div>
+              <div><dt>GPT resets / attempts</dt><dd id="resets-value">—</dd></div>
+              <div><dt>Recovery hard resets</dt><dd id="hard-resets-value">—</dd></div>
+              <div><dt>Total control steps</dt><dd id="total-steps">—</dd></div>
+            </dl>
+            <p class="cost-note" id="cost-note">API usage × published pricing. Final billing may differ.</p>
+          </section>
+
+          <section class="panel events-panel">
+            <div class="panel-heading"><div><h2>Activity</h2></div><span class="tag" id="event-count">0</span></div>
+            <ol class="event-list" id="event-list"><li class="empty-state">Run events will appear here.</li></ol>
+          </section>
+        </aside>
+      </div>
+      <footer class="page-footer"><span>RILO <span class="footer-separator">/</span> Autonomous experimentation &amp; learning</span><span id="server-freshness">Waiting for server</span></footer>
+    </main>
+    <div class="mobile-controls" aria-label="Quick run controls">
+      <span id="mobile-phase">Waiting for server</span>
+      <button class="button primary" id="mobile-start" type="button" disabled>Start run</button>
+      <button class="button pause" id="mobile-pause" type="button" disabled>Ⅱ Pause</button>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rilo"
+version = "0.1.0"
+description = "An environment-independent robot experimentation loop with a GPT policy and live console"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "openai>=1.66,<3",
+  "pydantic>=2.8,<3", "numpy>=1.24,<2", "pillow>=10,<13", "python-dotenv>=1,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "httpx>=0.27,<1"]
+learning = ["torch>=2.2,<3"]
+libero = ["robosuite==1.4.1", "mujoco==3.2.7", "bddl==1.0.1", "easydict", "cloudpickle", "gym==0.26.2", "h5py", "torch>=2.2,<3", "future>=0.18,<2", "matplotlib<4"]
+
+[project.scripts]
+rilo = "rilo.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rilo = ["web/*.html", "web/*.css", "web/*.js"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

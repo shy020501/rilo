@@ -1,0 +1,27 @@
+# Local credentials (keep the key-free template in Git)
+.env
+.env.*
+!.env.example
+
+# Runtime data: runs, images, videos, project state, costs and model checkpoints
+artifacts/
+
+# Local environments and downloaded simulator assets
+.venv/
+vendor/
+
+# Python build and test outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+.coverage
+htmlcov/
+
+# Local logs and browser test outputs
+*.log
+playwright-report/
+test-results/
