@@ -22,6 +22,14 @@ from torch.utils.data import Dataset
 from rilo.contracts import Observation
 
 
+# Shared measured proprioception available in both native LIBERO recordings and
+# its published demonstrations. Extra measurements remain in the source receipts
+# but are not imputed for datasets that did not record velocities or grip-site pose.
+LIBERO_STATE_FIELDS = (
+    "robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos", "robot0_joint_pos",
+)
+
+
 class ObservationSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     cameras: tuple[str, ...]
@@ -224,6 +232,9 @@ def load_episode(path: Path, summary: dict, manifest: dict) -> RecordedEpisode:
                   "transitions": len(actions), "sha256": digest.hexdigest(),
                   "source_model": source_model, "source_policy": source_policy,
                   "learning": learning}
+    source = summary.get("source") or manifest.get("source")
+    if source:
+        provenance["source"] = deepcopy(source)
     if learned_task:
         # The configured GPT performs reset/judging, not the recorded task
         # actions. Preserve that distinct role plus all learning IDs/hashes.
@@ -234,6 +245,11 @@ def load_episode(path: Path, summary: dict, manifest: dict) -> RecordedEpisode:
 
 def _infer_spec(episode, manifest, image_size, state_fields=None, cameras=None):
     observation = episode.observations[0]
+    if state_fields is None and manifest.get("environment", {}).get("name") == "libero":
+        state_fields = LIBERO_STATE_FIELDS
+        missing = [name for name in state_fields if name not in observation["state"]]
+        if missing:
+            raise ValueError(f"Missing measured LIBERO proprioception: {', '.join(missing)}")
     if state_fields is None:
         # Flatten only direct numeric measured state entries. Nested metadata,
         # calibration, success labels and adapter info never become model input.

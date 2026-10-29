@@ -280,6 +280,17 @@ def test_unsupported_task_cannot_use_agent_reset(adapter):
     assert not adapter.describe()["agent_reset"]["supported"]
     with pytest.raises(RuntimeError, match="not supported"):
         adapter.begin_reset()
+    assert not adapter.describe()["free_space_reset"]["supported"]
+    with pytest.raises(RuntimeError, match="not supported"):
+        adapter.begin_free_space_reset()
+
+
+def test_full_reset_remains_supported_without_free_space_geometry(adapter):
+    _use_drawer_task(adapter)
+    adapter.reset(seed=0, task_id=0)
+    assert adapter.describe()["agent_reset"]["supported"]
+    assert not adapter.describe()["free_space_reset"]["supported"]
+    assert adapter.begin_reset().success
 
 
 def test_next_task_requires_explicit_completed_reset_stage(adapter):

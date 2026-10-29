@@ -11,7 +11,7 @@
   // through that transition so a run cannot silently resume after a reset.
   const activePhases = new Set(["initializing", "thinking", "executing"]);
   const phaseLabels = {
-    idle: "Not initialized", initializing: "Initializing", ready: "Ready",
+    idle: "Not initialized", connected: "Environment connected", initializing: "Initializing", ready: "Ready",
     thinking: "Agent thinking", executing: "Executing action", pausing: "Pausing…",
     paused: "Paused", completed: "Completed", stopped: "Stopped", error: "Error",
   };
@@ -85,7 +85,7 @@
     text("initialize-label", continuing ? "Continue from GPT reset" : "Initialize environment");
     for (const input of $("run-form").querySelectorAll("input, select")) input.disabled = !editable;
     $("start-button").disabled = !runnable;
-    $("step-button").disabled = !runnable;
+    $("step-button").disabled = !runnable || phase === "paused" || status?.run_started === true;
     $("pause-button").disabled = !ui.connected || !active || ui.pending === "pause" || ui.pending === "stop";
     $("stop-button").disabled = !ui.connected || Boolean(ui.pending) || !["ready", "initializing", "thinking", "executing", "paused", "pausing"].includes(phase);
     $("reset-button").disabled = !editable || !status?.observation || !["ready", "paused", "completed", "stopped", "error"].includes(phase);
@@ -98,7 +98,7 @@
     const messages = {
       idle: "Initialize the environment before starting.",
       initializing: number(status?.stats?.episodes) > 0 ? "Resetting for the next episode. You can pause before the next decision." : "Loading the environment and its first observation…",
-      ready: "Ready. Start a run or inspect one decision.",
+      ready: "Ready. Start run uses the configured count; Run once completes one episode and its reset.",
       thinking: resetting ? "GPT is choosing actions to restore the scene." : "Waiting for the policy to choose the next action.",
       executing: resetting ? "The robot is restoring the scene with GPT actions." : "The environment is executing the requested action.",
       pausing: "Pause requested. Waiting for the current control step or reset to finish.",
@@ -144,7 +144,7 @@
 
   function updateCameras(observation) {
     if (!observation) return;
-    const names = Array.isArray(observation.cameras) ? observation.cameras.map((camera) => typeof camera === "string" ? camera : camera.name).filter(Boolean) : Object.keys(observation.cameras || {});
+    const names = (Array.isArray(observation.cameras) ? observation.cameras.map((camera) => typeof camera === "string" ? camera : camera.name) : Object.keys(observation.cameras || {})).filter(name => typeof name === "string" && name && !/^reset_reference(?:_|$)/.test(name));
     const currentNames = Array.from(ui.cameras.keys());
     if (names.join("|") !== currentNames.join("|")) {
       $("camera-grid").replaceChildren();
@@ -326,9 +326,7 @@
   }
 
   function resetModeDescription() {
-    text("reset-mode-hint", $("reset-mode").value === "agent"
-      ? "GPT restores the scene using robot actions after each task."
-      : "The simulator resets the scene between tasks.");
+    text("reset-mode-hint", ({agent:"GPT restores the scene using robot actions after each task.",free_space:"GPT restores the target and retreats safely; the simulator then resets the scene.",environment:"The simulator resets the scene between tasks."})[$("reset-mode").value]);
   }
 
   async function loadTasks() {

@@ -35,32 +35,75 @@
   const date = (value, options = {}) => value ? new Date(value * 1000).toLocaleString("ko-KR", {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",...options}) : "—";
   const asset = (value) => typeof value === "string" && value.startsWith("/api/") ? value : "";
   const tag = (text, style = "neutral") => `<span class="tag ${style}">${esc(text)}</span>`;
-  const phaseNames = {idle:"실행 대기",initializing:"환경 준비 중",ready:"수집 준비 완료",thinking:"GPT 추론 중",executing:"Action 실행 중",pausing:"일시정지 중",paused:"일시정지",completed:"수집 완료",stopped:"실행 중지",error:"확인 필요"};
+  const phaseNames = {idle:"실행 대기",connected:"환경 연결됨",initializing:"환경 준비 중",ready:"수집 준비 완료",thinking:"GPT 추론 중",executing:"Action 실행 중",pausing:"일시정지 중",paused:"일시정지",completed:"수집 완료",stopped:"실행 중지",error:"확인 필요"};
   const activePhases = new Set(["initializing", "ready", "thinking", "executing", "pausing", "paused"]);
   const pausePhases = new Set(["initializing", "ready", "thinking", "executing"]);
-  const state = {workspace:null,status:null,detail:null,route:{id:null,tab:"overview"},connected:false,pending:null,pendingProjectId:null,pausePending:false,search:"",filter:"all",dataView:"active",episodeMutation:null,deleteTarget:null,deleteBusy:false,episodeDetail:null,episodeToken:0,workspaceSignature:"",detailSignature:"",navSignature:"",barSignature:"",statusBusy:false,statusRequest:0,workspaceBusy:false,routeToken:0,taskToken:0,tasks:[],lastObservation:null,lastCameras:"",lastEvents:"",toastTimer:null,pipeline:null,pipelineProjectId:null,pipelineBusy:false,pipelineRequest:0,pipelinePending:null,pipelinePausePending:false,pipelineMode:"auto",pipelineStage:"collect",pipelineDirty:false,pipelineConfigSignature:"",pipelineExecutionSignature:"",modelSignature:"",evaluationSignature:""};
+  const state = {workspace:null,status:null,detail:null,route:{id:null,tab:"overview"},connected:false,pending:null,pendingProjectId:null,pausePending:false,search:"",filter:"all",dataView:"active",episodeMutation:null,deleteTarget:null,deleteBusy:false,episodeDetail:null,episodeToken:0,workspaceSignature:"",detailSignature:"",navSignature:"",barSignature:"",statusBusy:false,statusRequest:0,workspaceBusy:false,routeToken:0,taskToken:0,tasks:[],lastObservation:null,lastCameras:"",lastEvents:"",toastTimer:null,pipeline:null,pipelineProjectId:null,pipelineBusy:false,pipelineRequest:0,pipelinePending:null,pipelinePausePending:false,evaluationStage:"bc_eval",pipelineExecutionSignature:"",modelSignature:"",evaluationSignature:"",evaluationCameraSignature:"",evaluationObservationKey:"",evaluationFrameToken:0,pipelineDialog:null,stageDialog:null,trainingAlgorithms:{},collectionSettingsExpanded:false,collectionSettingsDirty:false,collectionSettingsSignature:"",collectionSettingsSaving:false};
   const routeUrl = (id, tab = "overview") => `#/projects/${encodeURIComponent(id)}${tab === "overview" ? "" : `/${tab}`}`;
   const runtime = () => state.status || state.workspace?.runtime || {};
   const activeId = () => runtime().active_project_id;
   const currentProject = () => state.detail?.project;
   const stageCost = (episode, stage) => episode.costs?.[stage] || {};
   const episodeCost = (episode) => n(stageCost(episode,"task").estimated_cost_usd) + n(stageCost(episode,"reset").estimated_cost_usd);
+  const externalEpisode = (episode) => episode?.source?.kind === "external_dataset";
+  const episodeOutcomeLabel = (episode) => externalEpisode(episode) ? tag("외부 소스","neutral external-source") : outcomeLabel(episode.outcome);
+  const episodeResetLabel = (episode) => externalEpisode(episode) && (!episode.reset_outcome || episode.reset_outcome === "not_applicable") ? tag("해당 없음") : resetLabel(episode.reset_outcome);
   const complete = (episode) => episode.outcome === "success" && episode.reset_outcome === "success";
   const resetLabel = (outcome) => outcome === "success" ? tag("복구 완료","success") : outcome ? tag("복구 미완료","warning") : tag("대기");
-  const outcomeLabel = (outcome) => outcome === "success" ? tag("성공","success") : !outcome ? tag("진행 중") : tag("미완료","warning");
+  const outcomeLabel = (outcome) => outcome === "success" ? tag("성공","success") : !outcome ? tag("진행 중") : tag("실패","failure");
   const allEpisodes = () => [...(state.detail?.episodes || []),...(state.detail?.archived_episodes || [])];
   const findEpisode = (run,id) => allEpisodes().find(ep => ep.run_id === run && ep.id === id);
+  const episodeIndex = (episode) => episode.display_index ?? episode.index ?? 1;
+  const episodeLearning = (episode) => episode.learning || (state.detail?.runs || []).find(run => run.run_id === episode.run_id)?.config?.learning || (state.status?.run_id === episode.run_id ? state.status.learning : null) || {};
+  const episodeLabel = (episode) => `${["bc_eval","rl","rl_eval"].includes(episodeLearning(episode).pipeline_stage) ? "Rollout" : "Episode"} ${String(episodeIndex(episode)).padStart(2,"0")}`;
   const episodePath = (project,run,id) => `/api/projects/${encodeURIComponent(project)}/episodes/${encodeURIComponent(run)}/${encodeURIComponent(id)}`;
   const policyOptions = () => state.detail?.policy_options || state.workspace?.policy_options || {models:[],defaults:{}};
   const nextPolicy = (project) => ({model:state.workspace?.runtime?.model,reasoning_effort:state.workspace?.runtime?.reasoning_effort,...policyOptions().defaults,...project?.policy_config});
-  const policyLabel = (policy) => `${policy?.model || "—"} / ${policy?.reasoning_effort || "—"}`;
+  const effortLabel = (effort, current) => effort === "auto" ? `Auto${["medium","xhigh"].includes(current) ? ` · ${current}` : " · medium ↔ xhigh"}` : effort || "—";
+  const policyLabel = (policy) => `${policy?.model || "—"} / ${effortLabel(policy?.reasoning_effort,policy?.current_reasoning_effort)}`;
+  const qualityLabels = {within_grasp_budget:"Optimal",extra_grasp_attempts:"Sub-optimal",unknown:"분류 정보 없음",not_successful:"성공 미완료"};
+  const qualityKey = (episode, stage = "task") => {
+    const quality = episode.quality?.[stage] || {};
+    const mapped = {optimal:"within_grasp_budget",suboptimal:"extra_grasp_attempts",unknown:"unknown",not_successful:"not_successful"}[quality.classification];
+    if (mapped) return mapped;
+    const label = {success_without_reported_failure:"within_grasp_budget",recovered_success:"extra_grasp_attempts"}[quality.label] || quality.label;
+    return Object.prototype.hasOwnProperty.call(qualityLabels,label) ? label : "unknown";
+  };
+  const qualityTag = (episode, stage = "task") => {
+    const key = qualityKey(episode,stage);
+    return tag(qualityLabels[key],key === "within_grasp_budget" ? "success" : key === "extra_grasp_attempts" ? "warning" : "neutral");
+  };
+
+  const resetModeLabel = (mode) => ({agent:"GPT arm reset",environment:"환경 초기화",free_space:"대상 복구 + 안전 후퇴 후 환경 초기화"})[mode] || "GPT arm reset";
+  const closureCount = (value) => Number.isInteger(value) && value >= 0 ? `${count(value)}회` : "미확정";
+
+  function episodeQuality(episode) {
+    const quality = episode.quality?.task || {};
+    if (externalEpisode(episode) && qualityKey(episode,"task") === "unknown") return `<section class="episode-quality"><h3>성공 분류</h3>${tag("분류 정보 없음")}<p class="field-note">이 외부 데이터에는 grasp 횟수를 기준으로 한 분류 기록이 없습니다.</p></section>`;
+    const historical = ["success_without_reported_failure","recovered_success"].includes(quality.label);
+    return `<section class="episode-quality"><h3>성공 분류</h3><p class="field-note">${historical ? "기존 GPT 실패 보고를 기준으로 분류한 기록입니다." : "Task의 예상 grasp 횟수와 실제 gripper 닫기 횟수를 비교합니다. Reset 동작은 Task 횟수에 합산하지 않습니다."} Optimal은 최적 경로나 실제 무실패를 보장하지 않습니다.</p><div class="quality-stage"><div class="quality-stage-heading"><strong>Task</strong>${qualityTag(episode,"task")}<span>실제 ${closureCount(quality.actual_closures)} / 예상 ${closureCount(quality.expected_closures)}</span></div><p class="field-note">${historical ? "과거 GPT 실패 보고 기반 기록입니다. Grasp 횟수 기준으로 재분류하지 않았습니다." : quality.baseline_version ? `기준 버전 ${count(quality.baseline_version)} · ${quality.source === "manual" ? "사용자 설정" : quality.source === "gpt" ? "GPT 추정" : "기록된 기준"}` : "이 episode에 기록된 grasp 기준이 없습니다."}</p></div></section>`;
+  }
+
+  function episodeSourceDetails(episode) {
+    if (!externalEpisode(episode)) return "";
+    const source = episode.source;
+    const fields = [["데이터셋",source.dataset],["Suite",source.suite],["Task",source.task_name || (typeof source.task === "string" ? source.task : source.task?.name)],["Task ID",source.task_id],["Demo",source.demo_id ?? source.demo],["원본 파일",source.file ?? source.source_file],["등록 시각",source.imported_at ? date(source.imported_at) : null]];
+    return `<section class="episode-source"><h3>외부 데이터 출처</h3><p class="field-note">원본 데이터셋에서 가져온 episode입니다. RILO에서 GPT로 수행한 수집·reset 결과가 아닙니다.</p><dl>${fields.filter(([,value]) => value !== null && value !== undefined && value !== "" && ["string","number"].includes(typeof value)).map(([label,value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl></section>`;
+  }
+
+  function graspBaselinePanel(project) {
+    const baseline = project.grasp_baseline || {}, expected = baseline.expected_closures;
+    const assumptions = Array.isArray(baseline.assumptions) ? baseline.assumptions : [];
+    return `<section class="panel settings-section grasp-baseline-panel"><div class="panel-header"><div><h2>Task grasp 기준</h2><p>성공 episode의 grasp 횟수 분류에 사용할 예상값</p></div>${tag(baseline.source === "manual" ? "사용자 설정" : baseline.source === "gpt" ? "GPT 추정" : "자동 추정 대기")}</div><div class="panel-body"><p class="field-note">자동 추정은 실제 수집을 시작할 때 필요한 경우 수행하고, 같은 task의 기준을 재사용합니다. 수동 변경은 다음 새 run부터 적용됩니다. 기존 episode는 당시 기준을 유지합니다.</p>${baseline.rationale ? `<p class="baseline-rationale">${esc(baseline.rationale)}</p>` : ""}${assumptions.length ? `<ul class="baseline-assumptions">${assumptions.map(item => `<li>${esc(item)}</li>`).join("")}</ul>` : ""}<label class="field grasp-baseline-field">예상 gripper 닫기 횟수<input id="grasp-baseline-count" name="expected_grasp_closures" type="number" min="0" max="100" step="1" value="${Number.isInteger(expected) ? expected : ""}" data-saved-expected="${Number.isInteger(expected) ? expected : ""}" placeholder="자동 추정"><small>비워서 설정을 저장하면 다음 수집 시작 시 자동 추정합니다.</small></label><p class="field-note">${baseline.version ? `저장된 기준 v${count(baseline.version)}` : "저장된 기준 없음"} · 아래 설정 저장 버튼으로 함께 저장합니다.</p></div></section>`;
+  }
+
   const pipelineStages = [
-    {id:"collect",number:"01",name:"GPT 데이터 수집",short:"수집",icon:"database",description:"정해진 수만큼 task와 GPT reset을 수행하고 성공·실패를 함께 저장합니다."},
+    {id:"collect",number:"01",name:"GPT 데이터 수집",short:"수집",icon:"database",description:"사용 중인 성공 task episode를 목표까지 모읍니다. 성공·실패 기록은 모두 저장합니다."},
     {id:"bc",number:"02",name:"Diffusion Policy 학습",short:"DP 학습",icon:"model",description:"수집을 멈춘 상태에서 성공 task 데이터로 BC 정책을 학습합니다."},
-    {id:"bc_eval",number:"03",name:"BC 성공률 평가",short:"BC 평가",icon:"check",description:"DP로 rollout하고 GPT로 reset합니다. 목표 미달이면 수집·학습을 반복합니다."},
+    {id:"bc_eval",number:"03",name:"BC 성공률 평가",short:"BC 평가",icon:"check",description:"DP로 rollout하고 선택한 평가 reset 방식으로 복구한 뒤 실제 성공률을 기록합니다."},
     {id:"progress",number:"04",name:"Progress 모델 학습",short:"Progress",icon:"progress",description:"BC 성공률 목표를 달성한 뒤 성공 데이터만 사용해 진행도를 학습합니다."},
     {id:"rl",number:"05",name:"Residual TD3 학습",short:"Residual RL",icon:"layers",description:"Frozen DP에 매 step correction을 더하고 offline·online replay를 혼합합니다."},
-    {id:"rl_eval",number:"06",name:"RL 성공률 평가",short:"RL 평가",icon:"check",description:"BC+Residual의 성공률을 확인하고 목표에 도달할 때까지 online RL을 반복합니다."},
+    {id:"rl_eval",number:"06",name:"RL 성공률 평가",short:"RL 평가",icon:"check",description:"BC+Residual로 rollout하고 선택한 평가 reset 방식으로 복구한 뒤 실제 성공률을 기록합니다."},
   ];
   const pipelinePhaseNames = {idle:"실행 대기",running:"진행 중",paused:"일시정지",pausing:"일시정지 중",completed:"완료",stopped:"중지",error:"확인 필요",interrupted:"재개 준비 필요"};
   const pipelineActive = (phase) => ["running","paused","pausing"].includes(phase);
@@ -80,18 +123,26 @@
     return fallback;
   }
 
-  async function api(path, body, timeout = 15000) {
+  async function api(path, body, timeout = 15000, externalSignal) {
     const abort = new AbortController();
+    const externalAbort = () => abort.abort();
+    if (externalSignal?.aborted) abort.abort();
+    else externalSignal?.addEventListener("abort",externalAbort,{once:true});
     const timer = setTimeout(() => abort.abort(), timeout);
     try {
       const response = await fetch(path, {method:body === undefined ? "GET" : "POST",body:body === undefined ? undefined : JSON.stringify(body),headers:body === undefined ? {Accept:"application/json"} : {Accept:"application/json","Content-Type":"application/json"},cache:"no-store",credentials:"same-origin",signal:abort.signal});
       const result = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(errorText(result, `요청을 처리하지 못했습니다 (${response.status}).`));
+      if (!response.ok) {
+        const error = new Error(errorText(result, `요청을 처리하지 못했습니다 (${response.status}).`));
+        error.status = response.status;
+        error.detail = result.detail;
+        throw error;
+      }
       return result;
     } catch (error) {
       if (error.name === "AbortError") throw new Error("서버 응답을 기다리는 중입니다. 실행 상태를 확인한 뒤 다시 시도해주세요.");
       throw error;
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer);externalSignal?.removeEventListener("abort",externalAbort); }
   }
 
   function toast(message, error = false) {
@@ -143,7 +194,7 @@
       state.barSignature = signature;
       const project = state.workspace?.projects.find(x => x.id === learning.project_id);
       $("global-run").hidden = false;
-      $("global-run").innerHTML = `<div class="global-run-copy"><i class="dot ${learning.phase === "running" ? "dot-pulse" : ""}"></i><a href="${routeUrl(learning.project_id,"models")}"><strong>${esc(project?.name || "학습 파이프라인")}</strong></a><span>· ${esc(pipelineStageName(learning.stage))} / ${esc(pipelinePhaseNames[learning.phase] || learning.phase)}</span></div><button class="button pause" data-action="pipeline-global-pause" data-project="${esc(learning.project_id)}" ${learning.phase !== "running" || state.pipelinePausePending || !state.connected ? "disabled" : ""}>${icon("pause")}${state.pipelinePausePending ? "일시정지 요청 중…" : learning.phase === "paused" ? "일시정지됨" : "Pause"}</button>`;
+      $("global-run").innerHTML = `<div class="global-run-copy"><i class="dot ${learning.phase === "running" ? "dot-pulse" : ""}"></i><a href="${routeUrl(learning.project_id,"overview")}"><strong>${esc(project?.name || "학습 파이프라인")}</strong></a><span>· ${esc(pipelineStageName(learning.stage))} / ${esc(pipelinePhaseNames[learning.phase] || learning.phase)}</span></div><button class="button pause" data-action="pipeline-global-pause" data-project="${esc(learning.project_id)}" ${learning.phase !== "running" || state.pipelinePausePending || !state.connected ? "disabled" : ""}>${icon("pause")}${state.pipelinePausePending ? "일시정지 요청 중…" : learning.phase === "paused" ? "일시정지됨" : "Pause"}</button>`;
       return;
     }
     const id = s.active_project_id;
@@ -154,7 +205,7 @@
     $("global-run").hidden = !visible;
     if (!visible) return;
     const project = state.workspace?.projects.find(x => x.id === id);
-    $("global-run").innerHTML = `<div class="global-run-copy"><i class="dot ${["thinking","executing"].includes(s.phase) ? "dot-pulse" : ""}"></i><a href="${id ? routeUrl(id,"collection") : "/console"}"><strong>${esc(project?.name || (state.pending === "initialize" ? "환경 준비 중" : "실행 콘솔의 수집"))}</strong></a><span>· ${esc(phaseNames[s.phase] || s.phase)}${s.stage === "reset" ? " / GPT reset" : ""}</span></div><button class="button pause" data-action="global-pause" ${!pausePhases.has(s.phase) || state.pausePending || !state.connected ? "disabled" : ""}>${icon("pause")}${state.pausePending ? "일시정지 요청 중…" : s.phase === "paused" ? "일시정지됨" : "Pause"}</button>`;
+    $("global-run").innerHTML = `<div class="global-run-copy"><i class="dot ${["thinking","executing"].includes(s.phase) ? "dot-pulse" : ""}"></i><a href="${id ? routeUrl(id,"collection") : "/console"}"><strong>${esc(project?.name || (state.pending === "connect" ? "환경 연결 중" : "실행 콘솔의 수집"))}</strong></a><span>· ${esc(phaseNames[s.phase] || s.phase)}${s.stage === "reset" ? " / GPT reset" : ""}</span></div><button class="button pause" data-action="global-pause" ${!pausePhases.has(s.phase) || state.pausePending || !state.connected ? "disabled" : ""}>${icon("pause")}${state.pausePending ? "일시정지 요청 중…" : s.phase === "paused" ? "일시정지됨" : "Pause"}</button>`;
   }
 
   function projectCard(project) {
@@ -178,59 +229,525 @@
     if (!state.workspace) return;
     const w = state.workspace, t = w.totals || {}, r = w.runtime || {};
     document.title = "RILO · 워크스페이스";
-    $("content").innerHTML = `<section class="page-heading"><div><span class="eyebrow">WORKSPACE OVERVIEW</span><h1>워크스페이스</h1><p>프로젝트별로 데이터를 모으고, 학습으로 이어지는 흐름을 확인하세요.</p></div><div class="heading-action"><button class="button primary" data-action="create">${icon("plus")}새 프로젝트</button></div></section><section class="metrics" aria-label="전체 실험 지표">${metric("프로젝트",`${count(t.projects)}<span class="metric-unit">개</span>`,`${count(t.runs)}개의 실행 기록`,"folder")}${metric("수집된 성공 demo",`${count(t.successes)}<span class="metric-unit">개</span>`,`${count(t.episodes)} episodes · Task 성공 기준`,"database")}${metric("완료된 GPT reset",`${count(t.reset_successes)}<span class="metric-unit">/ ${count(t.episodes)}</span>`,"Task 후 환경 복구까지 완료", "reset")}${metric("누적 사용 비용",money(t.estimated_cost_usd),`${count(t.total_tokens)} tokens · 보관·삭제 포함`,"dollar")}</section><div class="home-layout"><section><div class="section-header"><div class="section-header-left"><h2>프로젝트</h2><span class="count-tag">${count(t.projects)}</span></div><label class="search-box">${icon("search")}<input id="project-search" placeholder="프로젝트 검색" aria-label="프로젝트 검색" value="${esc(state.search)}"></label></div><div id="project-cards" class="project-grid"></div><p class="home-footnote">${icon("info")}기존 실행 기록을 프로젝트별로 연결했습니다. 성공 demo와 reset 완료는 각각 집계됩니다.</p></section><aside class="home-aside"><section class="side-panel"><h3>${icon("flow")}파이프라인 연결 상태</h3><ul class="capability-list"><li><span>GPT 데이터 수집 · Reset</span>${tag("사용 가능","success")}</li><li><span>BC · Progress 학습</span>${tag(w.capabilities?.bc ? "사용 가능" : "연결 전",w.capabilities?.bc ? "success" : "neutral")}</li><li><span>BC 정책 평가</span>${tag(w.capabilities?.evaluation ? "사용 가능" : "연결 전",w.capabilities?.evaluation ? "success" : "neutral")}</li><li><span>Residual RL</span>${tag(w.capabilities?.rl ? "사용 가능" : "연결 전",w.capabilities?.rl ? "success" : "neutral")}</li></ul><p class="side-note">${w.capabilities?.bc ? "프로젝트의 모델 탭에서 전체 자동 실행과 단계별 실행을 선택할 수 있습니다. 학습 중에는 수집을 멈춥니다." : "모델 탭에서 파이프라인 연결 상태를 확인할 수 있습니다."}</p></section><section class="side-panel"><h3>${icon("terminal")}연결된 실행 환경</h3><dl class="runtime-list"><div><dt>Environment</dt><dd>${esc(r.backend?.toUpperCase() || "—")}</dd></div><div><dt>Teacher model</dt><dd class="code">${esc(r.policy === "scripted" ? "Scripted demo" : r.model || "—")}</dd></div><div><dt>Reasoning</dt><dd>${esc(r.reasoning_effort || "—")}</dd></div><div><dt>Worker</dt><dd>1 · ${esc(phaseNames[r.phase] || "실행 대기")}</dd></div></dl><p class="side-note">${r.policy === "scripted" ? "UI 검증용 demo 서버입니다. GPT를 호출하지 않습니다." : "프로젝트를 준비한 뒤 수집 시작을 누르면 모델이 호출됩니다."}</p></section></aside></div>`;
+    $("content").innerHTML = `<section class="page-heading"><div><span class="eyebrow">WORKSPACE OVERVIEW</span><h1>워크스페이스</h1><p>프로젝트별로 데이터를 모으고, 학습으로 이어지는 흐름을 확인하세요.</p></div><div class="heading-action"><button class="button primary" data-action="create">${icon("plus")}새 프로젝트</button></div></section><section class="metrics" aria-label="전체 실험 지표">${metric("프로젝트",`${count(t.projects)}<span class="metric-unit">개</span>`,`${count(t.runs)}개의 실행 기록`,"folder")}${metric("수집된 성공 demo",`${count(t.successes)}<span class="metric-unit">개</span>`,`${count(t.episodes)} episodes · Task 성공 기준`,"database")}${metric("완료된 GPT reset",`${count(t.reset_successes)}<span class="metric-unit">/ ${count(t.episodes)}</span>`,"Task 후 환경 복구까지 완료", "reset")}${metric("데이터 사용 비용",money(t.estimated_cost_usd),`${count(t.total_tokens)} tokens · 사용 중·보관 중 합계`,"dollar")}</section><div class="home-layout"><section><div class="section-header"><div class="section-header-left"><h2>프로젝트</h2><span class="count-tag">${count(t.projects)}</span></div><label class="search-box">${icon("search")}<input id="project-search" placeholder="프로젝트 검색" aria-label="프로젝트 검색" value="${esc(state.search)}"></label></div><div id="project-cards" class="project-grid"></div><p class="home-footnote">${icon("info")}기존 실행 기록을 프로젝트별로 연결했습니다. 성공 demo와 reset 완료는 각각 집계됩니다.</p></section><aside class="home-aside"><section class="side-panel"><h3>${icon("flow")}파이프라인 연결 상태</h3><ul class="capability-list"><li><span>GPT 데이터 수집 · Reset</span>${tag("사용 가능","success")}</li><li><span>BC · Progress 학습</span>${tag(w.capabilities?.bc ? "사용 가능" : "연결 전",w.capabilities?.bc ? "success" : "neutral")}</li><li><span>BC 정책 평가</span>${tag(w.capabilities?.evaluation ? "사용 가능" : "연결 전",w.capabilities?.evaluation ? "success" : "neutral")}</li><li><span>Residual RL</span>${tag(w.capabilities?.rl ? "사용 가능" : "연결 전",w.capabilities?.rl ? "success" : "neutral")}</li></ul><p class="side-note">${w.capabilities?.bc ? "개요에서 전체 파이프라인을 설정·실행하고, 모델 탭에서 개별 학습을, 평가 탭에서 개별 평가를 관리합니다." : "모델 탭에서 파이프라인 연결 상태를 확인할 수 있습니다."}</p></section><section class="side-panel"><h3>${icon("terminal")}연결된 실행 환경</h3><dl class="runtime-list"><div><dt>Environment</dt><dd>${esc(r.backend?.toUpperCase() || "—")}</dd></div><div><dt>Teacher model</dt><dd class="code">${esc(r.policy === "scripted" ? "Scripted demo" : r.model || "—")}</dd></div><div><dt>Reasoning</dt><dd>${esc(r.reasoning_effort || "—")}</dd></div><div><dt>Worker</dt><dd>1 · ${esc(phaseNames[r.phase] || "실행 대기")}</dd></div></dl><p class="side-note">${r.policy === "scripted" ? "UI 검증용 demo 서버입니다. GPT를 호출하지 않습니다." : "프로젝트를 준비한 뒤 수집 시작을 누르면 모델이 호출됩니다."}</p></section></aside></div>`;
     if (r.policy !== "scripted") {
-      document.querySelector(".runtime-list + .side-note").textContent = "프로젝트 설정에서 모델·추론 수준을 선택할 수 있습니다. 변경값은 다음 환경 준비 또는 복구 후 이어 수집부터 적용됩니다.";
+      document.querySelector(".runtime-list + .side-note").textContent = "프로젝트 설정에서 모델·추론 수준을 선택할 수 있습니다. 변경값은 다음 새 run을 시작할 때 적용됩니다. 환경을 다시 연결할 필요는 없습니다.";
     }
     renderProjectCards();
     renderBreadcrumb();
   }
 
   function projectShell(project) {
-    const tabs = [["overview","개요","flow"],["collection","수집","camera"],["data","데이터","database"],["models","모델","model"],["settings","설정","settings"]];
+    const tabs = [["overview","개요","flow"],["collection","수집","camera"],["data","데이터","database"],["models","모델","model"],["evaluation","평가","check"],["settings","설정","settings"]];
     const status = projectStatus(project);
     return `<section class="page-heading project-heading"><div><span class="eyebrow">PROJECT WORKSPACE</span><h1>${esc(project.name)}</h1><p>${esc(project.description || project.task_name || "이 프로젝트의 데이터 수집과 학습 흐름을 관리하세요.")}</p><div class="project-title-meta">${tag(project.backend?.toUpperCase() || "ROBOT","outline")}${tag(project.suite || "Custom","outline")}<span class="project-task">Task ${n(project.task_id)} · ${esc(project.task_name || "")}</span></div></div><div class="project-header-actions">${tag(status.text,status.style)}${state.route.tab !== "collection" ? `<a class="button primary" href="${routeUrl(project.id,"collection")}">${icon("camera")}수집 화면</a>` : ""}</div></section><nav class="tabs" aria-label="프로젝트 메뉴">${tabs.map(([id,label,symbol]) => `<a href="${routeUrl(project.id,id)}" class="${state.route.tab === id ? "active" : ""}" ${state.route.tab === id ? 'aria-current="page"' : ""}>${icon(symbol)}${label}${id === "data" ? `<span class="tab-count">${count(project.stats?.episodes)}</span>` : ""}</a>`).join("")}</nav><div id="tab-content"></div>`;
   }
 
+  function overviewStageProgress(stage, project, pipeline) {
+    if (stage.id === "collect") {
+      const collection = pipeline?.completion?.collect || {};
+      const completed = collection.completed ?? project.stats?.successes;
+      const target = collection.target ?? pipeline?.config?.collection_episodes ?? project.pipeline?.demo_target;
+      if (typeof completed === "number" && Number.isFinite(completed) && typeof target === "number" && Number.isFinite(target) && target > 0) {
+        return {value:Math.min(100,Math.max(0,100*completed/target)),label:completed >= target ? "수집 목표 달성" : "성공 데이터 수집",detail:`${count(completed)} / ${count(target)} 성공 episodes · 사용 중 데이터`};
+      }
+      return {value:null,label:"상태 확인 중",detail:"성공 데이터와 목표를 확인하고 있습니다"};
+    }
+    if (!pipeline || pipeline.unavailable) return {value:null,label:"상태 확인 중",detail:"실행 상태를 기다리고 있습니다"};
+    const status = pipeline.status || {}, current = status.stage === stage.id, active = current && pipelineActive(status.phase);
+    const completion = pipeline.completion?.stages?.[stage.id];
+    if (completion && !active) return completion.complete
+      ? {value:100,label:"완료",detail:completion.reason || "현재 데이터·설정에 맞는 결과가 있습니다"}
+      : {value:0,label:"실행 필요",detail:completion.reason || "현재 조건에 맞는 결과가 필요합니다"};
+    const metrics = current ? status.metrics || {} : status.stage_metrics?.[stage.id] || {};
+    const started = [...(status.events || [])].reverse().find(event => event.message === `${stage.id} 단계 시작`)?.time;
+    const phaseLabel = current ? pipelinePhaseNames[status.phase] || "진행률 확인 중" : "실행 대기";
+    const ratio = (done,total,detail) => typeof done === "number" && Number.isFinite(done) && typeof total === "number" && Number.isFinite(total) && total > 0
+      ? {value:Math.max(0,Math.min(100,100*done/total)),label:phaseLabel,detail} : null;
+    if (active && ["bc","progress"].includes(stage.id)) {
+      return ratio(metrics.step,pipeline.config?.[stage.id]?.steps,`${count(metrics.step)} / ${count(pipeline.config?.[stage.id]?.steps)} 학습 steps`) || {value:null,label:phaseLabel,detail:"학습 진행률 확인 중"};
+    }
+    const live = state.status || {}, learning = live.learning || {};
+    const liveMatches = current && live.active_project_id === project.id && Boolean(status.job_id) && learning.job_id === status.job_id && learning.pipeline_stage === stage.id && typeof started === "number" && typeof live.episode?.started_at === "number" && live.episode.started_at >= started;
+    if (liveMatches) {
+      const resetPending = live.config?.reset_mode === "free_space" && live.episode?.reset_outcome === "success" && !live.episode?.environment_reset_done;
+      const environmentReset = live.config?.reset_mode === "environment";
+      const done = environmentReset ? live.stats?.episodes : typeof live.stats?.reset_successes === "number" ? Math.max(0,live.stats.reset_successes-(resetPending ? 1 : 0)) : undefined;
+      const progress = ratio(done,live.config?.episodes,`${count(done)} / ${count(live.config?.episodes)} episodes · ${environmentReset ? "환경 reset" : "reset 포함"}`);
+      if (progress) return progress;
+    }
+    if (completion) return {value:null,label:phaseLabel,detail:"실행 진행률 확인 중"};
+    const completed = detail => ({value:100,label:current ? "완료" : "최근 완료",detail});
+    const modelKind = stage.id === "bc" ? "bc" : stage.id === "rl" ? "residual" : null;
+    const model = modelKind && [...(pipeline.models || [])].reverse().find(item => item.kind === modelKind && item.status === "ready" && item.metrics?.partial !== true && typeof status.started_at === "number" && item.created_at >= status.started_at && (!current || typeof started === "number" && item.created_at >= started));
+    if (model) {
+      const steps = model.metrics?.steps_completed ?? model.metrics?.step;
+      return completed(stage.id === "bc" ? typeof steps === "number" ? `${count(steps)} 학습 steps` : "학습 완료" : "Checkpoint 저장 완료");
+    }
+    if (metrics.run_id && typeof metrics.episodes === "number" && stage.id !== "rl") return completed(`${count(metrics.episodes)} episodes · reset 완료`);
+    if (current && status.phase === "completed") return completed("요청한 단계 완료");
+    if (stage.id === "rl" && metrics.run_id && typeof metrics.episodes === "number") return {value:100,label:phaseLabel,detail:"Rollout 완료 · checkpoint 확인 중"};
+    if (!current && !started) return {value:0,label:"실행 대기",detail:"아직 시작하지 않았습니다"};
+    return {value:null,label:phaseLabel,detail:current ? "실행 진행률 확인 중" : "진행 기록 확인 중"};
+  }
+
+  const manualPipelineStages = () => pipelineStages.filter(stage => (state.route.tab === "evaluation" ? ["bc_eval","rl_eval"] : ["bc","rl"]).includes(stage.id));
+  const selectedPipelineStage = () => state.route.tab === "evaluation" ? state.evaluationStage : "bc";
+
+  function autoPlanCopy(pipeline) {
+    const plan = pipeline?.auto_plan, collection = pipeline?.completion?.collect;
+    if (!plan) return "현재 데이터와 모델을 확인하고 있습니다.";
+    if (plan.complete) return "현재 데이터·설정에 맞는 학습과 평가 결과가 있고 모든 성공률 목표를 충족했습니다. 추가 실행이 필요하지 않습니다.";
+    if (plan.next_stage === "collect") return `사용 중인 성공 task episode ${count(collection?.completed)} / ${count(collection?.target)}개를 보유하고 있습니다. 남은 성공 episode ${count(plan.remaining_episodes)}개를 수집한 뒤 필요한 학습·평가를 이어갑니다.`;
+    return `${pipelineStageName(plan.next_stage)}부터 진행합니다. 현재 데이터·설정에 맞는 완료 결과를 재사용하며 남은 단계만 실행합니다.`;
+  }
+
+  function pipelineControlStrip(status) {
+    const busy = pipelineActive(status.phase), paused = status.phase === "paused";
+    return `<div class="pipeline-control-strip"><div><span class="pipeline-current-label">${status.stage ? esc(pipelineStageName(status.stage)) : "아직 시작하지 않았습니다"}</span><span>${status.mode ? `${status.mode === "auto" ? "자동" : "단계별"} 실행` : ""}${status.cycle ? ` · Cycle ${count(status.cycle)}` : ""}${status.round ? ` · Round ${count(status.round)}` : ""}</span></div><div class="pipeline-control-buttons"><button class="button pause small" data-action="pipeline-pause" ${status.phase !== "running" || state.pipelinePausePending || !state.connected ? "disabled" : ""}>${icon("pause")}${state.pipelinePausePending ? "요청 중…" : "Pause"}</button><button class="button secondary small" data-action="pipeline-resume" ${!paused || state.pipelinePending || state.pipelinePausePending || !state.connected ? "disabled" : ""}>${icon("play")}재개</button><button class="button danger small" data-action="pipeline-stop" ${!busy || state.pipelinePending || !state.connected ? "disabled" : ""}>${icon("stop")}중지</button></div></div>${status.error ? `<p class="pipeline-error" role="alert">${esc(status.error)}</p>` : ""}`;
+  }
+
   function renderPipeline(project) {
     const pipeline = currentPipeline(), status = pipeline?.status || {}, enabled = pipelineEnabled();
-    const config = pipeline?.config || {};
-    return `<section class="panel pipeline-panel"><div class="panel-header"><div><h2>Orchestration</h2><p>수집 → DP 학습 → 평가 → Progress → Residual RL</p></div><a href="${routeUrl(project.id,"models")}" class="button secondary small">${icon("model")}모델 · 파이프라인</a></div><div class="sequential-pipeline">${pipelineStages.map((stage,index) => `<div class="sequence-stage ${status.stage === stage.id && pipelineActive(status.phase) ? "current" : ""}"><span class="sequence-number">${stage.number}</span><div><h3>${esc(stage.short)}</h3><p>${stage.id === "collect" ? `${count(config.collection_episodes ?? project.pipeline?.demo_target ?? 20)} episodes · 성공/실패` : stage.id === "bc" ? "수집 중지 후 학습" : stage.id === "bc_eval" ? `목표 ${finiteValue(config.bc_success_target ?? project.pipeline?.bc_success_target ?? 70,1)}%` : stage.id === "progress" ? "목표 통과 · 성공 데이터" : stage.id === "rl" ? "Frozen DP + correction" : `목표 ${finiteValue(config.rl_success_target ?? project.pipeline?.rl_success_target ?? 90,1)}%`}</p></div>${index < pipelineStages.length-1 ? `<span class="sequence-arrow">${icon("arrow")}</span>` : ""}</div>`).join("")}</div><div class="pipeline-note">${icon("info")}${enabled ? "BC 평가 목표에 미달하면 수집·학습·평가를 반복합니다. Progress 학습 후 online RL로 이어지며 reset은 GPT가 수행합니다." : "학습 worker 연결 전입니다. 프로젝트의 데이터와 기존 수집 기능은 그대로 사용할 수 있습니다."}${status.stage ? `<span class="sequence-status">${tag(pipelinePhaseNames[status.phase] || status.phase,status.phase === "running" ? "success" : status.phase === "error" ? "warning" : "neutral")} ${esc(pipelineStageName(status.stage))}</span>` : ""}</div></section>`;
+    const config = pipeline?.config || {}, stages = pipelineStages.filter(stage => stage.id !== "progress");
+    const plan = pipeline?.auto_plan, ready = pipelineReadiness("auto"), busy = pipelineActive(status.phase), global = pipelineRuntime();
+    const other = global && pipelineActive(global.phase) && global.project_id !== project.id;
+    const unavailable = !state.connected || state.pipelinePending || state.pipelinePausePending || busy || other || !pipeline?.config;
+    const reason = other ? "다른 프로젝트의 파이프라인이 실행 중입니다." : !plan ? "남은 실행 단계를 확인하고 있습니다." : !plan.complete && !ready.ready ? ready.reason : "";
+    return `<section class="panel pipeline-panel"><div class="panel-header"><div><h2>Orchestration</h2><p>수집 → BC 학습 → BC 평가 → Residual RL → RL 평가</p></div><button class="button primary small" data-action="pipeline-start-auto" ${unavailable ? "disabled" : ""}>${icon("play")}${state.pipelinePending === "configure-start" ? "설정 저장·실행 중…" : "전체 파이프라인 실행"}</button></div><div class="overview-auto-plan"><p>${esc(autoPlanCopy(pipeline))}</p>${reason ? `<p class="pipeline-readiness" role="status">${icon("info")}${esc(reason)}</p>` : ""}</div>${busy || status.error || state.pipelinePending ? pipelineControlStrip(status) : ""}<div class="sequential-pipeline">${stages.map((stage,index) => {
+      const progress = overviewStageProgress(stage,project,pipeline), percent = progress.value === null ? null : Math.round(progress.value);
+      const description = stage.id === "collect" ? `${count(pipeline?.completion?.collect?.target ?? config.collection_episodes ?? project.pipeline?.demo_target ?? 20)} 성공 episodes 목표` : stage.id === "bc" ? "수집 중지 후 학습" : stage.id === "bc_eval" ? `목표 ${finiteValue(config.bc_success_target ?? project.pipeline?.bc_success_target ?? 70,1)}%` : stage.id === "rl" ? "Frozen DP + correction" : `목표 ${finiteValue(config.rl_success_target ?? project.pipeline?.rl_success_target ?? 90,1)}%`;
+      return `${index === 0 ? '<div class="sequence-bc-cycle"><div class="sequence-bc-flow">' : ""}<div class="sequence-stage ${status.stage === stage.id && pipelineActive(status.phase) ? "current" : ""}" data-stage="${stage.id}"><span class="sequence-number">${String(index+1).padStart(2,"0")}</span><div><h3>${esc(stage.short)}</h3><p>${esc(description)}</p></div><div class="sequence-progress"><div class="sequence-progress-label"><span>${esc(progress.label)}</span><strong>${percent === null ? "—" : `${percent}%`}</strong></div><div class="progress-track${percent === null ? " indeterminate" : ""}" role="progressbar" aria-label="${esc(stage.short)} 진행률" aria-valuemin="0" aria-valuemax="100" ${percent === null ? 'aria-valuetext="진행률 확인 중"' : `aria-valuenow="${percent}"`}><span ${percent === null ? "" : `style="width:${progress.value}%"`}></span></div><small>${esc(progress.detail)}</small></div>${index < stages.length-1 ? `<span class="sequence-arrow">${icon("arrow")}</span>` : ""}</div>${index === 2 ? '</div><div class="sequence-return" role="img" aria-label="03 BC 평가에서 목표에 미달하면 01 수집으로 돌아갑니다"><svg viewBox="0 0 300 32" preserveAspectRatio="none" aria-hidden="true"><defs><marker id="sequence-return-tip" viewBox="0 0 6 6" markerWidth="3.5" markerHeight="3.5" refX="5" refY="3" orient="auto"><path d="M1 1L5 3L1 5"/></marker></defs><path d="M250 1V24H50V2" marker-end="url(#sequence-return-tip)"/></svg><span>목표 미달 시 추가 수집</span></div></div>' : ""}`;
+    }).join("")}</div><div class="pipeline-note">${icon("info")}${enabled ? "사용 중인 성공 task 데이터와 현재 설정에 맞는 학습·평가 결과를 반영합니다. 보관·삭제 데이터는 수집 목표에서 제외되며, 자동 실행은 남은 단계부터 이어갑니다." : "학습 worker 연결 전입니다. 프로젝트의 데이터와 기존 수집 기능은 그대로 사용할 수 있습니다."}${status.stage ? `<span class="sequence-status">${tag(pipelinePhaseNames[status.phase] || status.phase,status.phase === "running" ? "success" : status.phase === "error" ? "warning" : "neutral")} ${esc(status.stage === "progress" ? "RL 학습 준비" : pipelineStageName(status.stage))}</span>` : ""}</div></section>`;
   }
 
   function episodesTable(episodes, compact = false) {
+    const selection = compact ? null : currentDataSelection();
     const rows = episodes.map(ep => {
-      const label = `Episode ${String(ep.index || 1).padStart(2,"0")}`;
+      const label = episodeLabel(ep);
       const attrs = `data-run="${esc(ep.run_id)}" data-episode="${esc(ep.id)}"`;
       const disabled = ep.can_manage !== true || Boolean(state.episodeMutation);
       const reason = ep.manage_disabled_reason || (disabled ? "실행 기록이 정리된 후 관리할 수 있습니다." : "");
       const archiveLabel = ep.archived ? "보관 해제" : "보관";
       const pendingDelete = ep.delete_pending === true;
-      return `<tr data-episode-row="${esc(ep.id)}" data-run-row="${esc(ep.run_id)}"><td><strong>${esc(label)}</strong><span class="table-sub">${esc(date(ep.started_at))}</span>${ep.archived ? `<span class="table-sub">보관 ${esc(date(ep.archived_at))}</span>` : ""}</td><td>${pendingDelete ? tag("삭제 미완료","warning") : outcomeLabel(ep.outcome)}</td><td>${pendingDelete ? "—" : resetLabel(ep.reset_outcome)}</td>${compact ? "" : `<td>${count(ep.steps)} <span class="cell-muted">/</span> ${count(ep.reset_steps)}</td>`}<td>${money(episodeCost(ep),compact ? 2 : 4)}</td><td class="episode-detail-cell"><button class="table-action" data-action="episode" ${attrs} aria-label="${esc(label)} 상세 보기" ${pendingDelete ? 'disabled title="삭제가 진행된 데이터입니다. 휴지통을 눌러 삭제를 완료하세요."' : ""}>${icon(ep.video_url ? "play" : "external")}${ep.video_url ? "상세 / 영상" : "상세"}</button></td><td class="episode-manage-cell"><div class="episode-row-actions"><button class="icon-button episode-icon" data-action="${ep.archived ? "restore-episode" : "archive-episode"}" ${attrs} aria-label="${esc(label)} ${archiveLabel}" title="${esc(pendingDelete ? "삭제가 진행된 데이터는 보관 해제할 수 없습니다." : reason || archiveLabel)}" ${disabled || pendingDelete ? "disabled" : ""}>${icon(ep.archived ? "restore" : "archive")}</button><button class="icon-button episode-icon delete-icon" data-action="delete-episode" ${attrs} aria-label="${esc(label)} 영구 삭제" title="${esc(reason || "영구 삭제")}" ${disabled ? "disabled" : ""}>${icon("trash")}</button></div></td></tr>`;
+      const selectCell = selection ? `<td class="episode-select-cell"><input type="checkbox" data-episode-select ${attrs} aria-label="${esc(label)} 선택" ${selection.selected.has(episodeSelectionKey(ep)) ? "checked" : ""} ${!canSelectEpisode(ep,selection.mode) || state.episodeMutation ? "disabled" : ""}></td>` : "";
+      return `<tr class="episode-clickable-row" data-episode-row="${esc(ep.id)}" data-run-row="${esc(ep.run_id)}" ${pendingDelete ? 'aria-disabled="true"' : `tabindex="0" role="button" data-action="episode" ${attrs} aria-label="${esc(label)} 보기"`}>${selectCell}<td><strong>${esc(label)}</strong><span class="table-sub">${esc(date(ep.started_at))}</span>${ep.archived ? `<span class="table-sub">보관 ${esc(date(ep.archived_at))}</span>` : ""}</td><td>${pendingDelete ? tag("삭제 미완료","warning") : episodeOutcomeLabel(ep)}${!pendingDelete && ep.outcome === "success" && (!externalEpisode(ep) || qualityKey(ep,"task") !== "unknown") ? `<span class="episode-quality-tag">${qualityTag(ep,"task")}</span>` : ""}</td><td>${pendingDelete ? "—" : episodeResetLabel(ep)}</td>${compact ? "" : `<td>${count(ep.steps)} <span class="cell-muted">/</span> ${count(ep.reset_steps)}</td>`}<td>${money(episodeCost(ep),compact ? 2 : 4)}</td><td class="episode-manage-cell"><div class="episode-row-actions"><button class="icon-button episode-icon" data-action="${ep.archived ? "restore-episode" : "archive-episode"}" ${attrs} aria-label="${esc(label)} ${archiveLabel}" title="${esc(pendingDelete ? "삭제가 진행된 데이터는 보관 해제할 수 없습니다." : reason || archiveLabel)}" ${disabled || pendingDelete ? "disabled" : ""}>${icon(ep.archived ? "restore" : "archive")}</button><button class="icon-button episode-icon delete-icon" data-action="delete-episode" ${attrs} aria-label="${esc(label)} 영구 삭제" title="${esc(reason || "영구 삭제")}" ${disabled ? "disabled" : ""}>${icon("trash")}</button></div></td></tr>`;
     }).join("");
     const empty = state.route.tab === "data" && state.dataView === "archived" ? "보관된 episode가 없습니다." : state.filter !== "all" && state.route.tab === "data" ? "선택한 결과에 해당하는 episode가 없습니다." : "아직 저장된 episode가 없습니다. 수집 화면에서 첫 실행을 준비하세요.";
-    return `<div class="table-wrap"><table><thead><tr><th>Episode</th><th>Task</th><th>GPT reset</th>${compact ? "" : "<th>Step (Task / Reset)</th>"}<th>API 비용</th><th class="episode-detail-cell"><span class="sr-only">상세 / 영상</span></th><th class="episode-manage-cell"><span class="sr-only">Episode 관리</span></th></tr></thead><tbody>${rows || `<tr><td class="table-empty" colspan="${compact ? 6 : 7}">${empty}</td></tr>`}</tbody></table></div>`;
+    return `<div class="table-wrap"><table><thead><tr>${selection ? '<th class="episode-select-cell"><input id="episode-select-all" type="checkbox" aria-label="현재 목록에서 선택 가능한 데이터 전체 선택"></th>' : ""}<th>Episode / Rollout</th><th>Task</th><th>GPT reset</th>${compact ? "" : "<th>Step (Task / Reset)</th>"}<th>API 비용</th><th class="episode-manage-cell"><span class="sr-only">Episode 관리</span></th></tr></thead><tbody>${rows || `<tr><td class="table-empty" colspan="${(compact ? 5 : 6) + (selection ? 1 : 0)}">${empty}</td></tr>`}</tbody></table></div>`;
   }
 
   function renderOverview(project) {
     const stats = project.stats || {};
     const episodes = (state.detail.episodes || []).slice().sort((a,b) => n(b.started_at)-n(a.started_at));
-    $("tab-content").innerHTML = `${renderPipeline(project)}<section class="metrics" aria-label="프로젝트 지표">${metric("성공 demo",`${count(stats.successes)}<span class="metric-unit">개</span>`,`${count(stats.episodes)} episodes 중 Task 성공`,"database")}${metric("GPT reset 완료",`${count(stats.reset_successes)}<span class="metric-unit">/ ${count(stats.episodes)}</span>`,"환경 복구 검증 통과","reset")}${metric("전체 실행 step",count(stats.total_steps),"Task + Reset control ticks","layers")}${metric("누적 사용 비용",money(stats.estimated_cost_usd),`${count(stats.total_tokens)} tokens · 보관·삭제 포함`,"dollar")}</section><div class="overview-bottom"><section class="panel"><div class="panel-header"><h2>최근 episodes</h2><a class="button quiet small" href="${routeUrl(project.id,"data")}">전체 보기 ${icon("arrow")}</a></div>${episodesTable(episodes.slice(0,4),true)}</section><section class="panel"><div class="panel-header"><h2>수집 설정</h2><a href="${routeUrl(project.id,"settings")}" class="icon-button" aria-label="수집 설정 편집">${icon("settings")}</a></div><div class="panel-body"><dl class="project-rules"><div><dt>수집당 episode</dt><dd>${n(project.run_config?.episodes) || 1} episodes</dd></div><div><dt>Reset 방식</dt><dd>${project.run_config?.reset_mode === "environment" ? "환경 초기화" : "GPT가 팔을 조작하여 복구"}</dd></div><div><dt>실행당 API 예산</dt><dd>${money(project.run_config?.budget_usd)}</dd></div></dl><p class="muted-info">설정은 다음 실행부터 적용됩니다. 프로젝트를 열거나 편집해도 수집은 시작되지 않습니다.</p></div></section></div>`;
+    $("tab-content").innerHTML = `${renderPipeline(project)}<section class="metrics" aria-label="프로젝트 지표">${metric("성공 demo",`${count(stats.successes)}<span class="metric-unit">개</span>`,`${count(stats.episodes)} episodes 중 Task 성공`,"database")}${metric("GPT reset 완료",`${count(stats.reset_successes)}<span class="metric-unit">/ ${count(stats.episodes)}</span>`,"환경 복구 검증 통과","reset")}${metric("전체 실행 step",count(stats.total_steps),"Task + Reset control ticks","layers")}${metric("데이터 사용 비용",money(stats.estimated_cost_usd),`${count(stats.total_tokens)} tokens · 사용 중·보관 중 합계`,"dollar")}</section><div class="overview-bottom"><section class="panel"><div class="panel-header"><h2>최근 episodes</h2><a class="button quiet small" href="${routeUrl(project.id,"data")}">전체 보기 ${icon("arrow")}</a></div>${episodesTable(episodes.slice(0,4),true)}</section><section class="panel"><div class="panel-header"><h2>수집 설정</h2><a href="${routeUrl(project.id,"collection")}" class="icon-button" aria-label="수집 설정 편집">${icon("settings")}</a></div><div class="panel-body"><dl class="project-rules"><div><dt>수집당 episode</dt><dd>${n(project.run_config?.episodes) || 1} episodes</dd></div><div><dt>Reset 방식</dt><dd>${esc(resetModeLabel(project.run_config?.reset_mode))}</dd></div><div><dt>실행당 API 예산</dt><dd>${money(project.run_config?.budget_usd)}</dd></div></dl><p class="muted-info">설정은 새 run을 시작할 때 적용됩니다. Pause·재개는 시작한 run의 설정을 유지합니다.</p></div></section></div>`;
+  }
+
+  function collectionGoalLocked() {
+    const pipeline = currentPipeline(), runtime = pipelineRuntime();
+    return !pipeline?.config || pipelineActive(pipeline.status?.phase) || Boolean(runtime?.project_id === state.route.id && pipelineActive(runtime.phase));
+  }
+
+  function renderCollectionSettings(project) {
+    const config = project.run_config || {}, goal = currentPipeline()?.config?.collection_episodes ?? project.pipeline?.demo_target ?? 20;
+    state.collectionSettingsSignature = JSON.stringify([config,currentPipeline()?.config?.collection_episodes]);
+    return `<section id="collection-settings-panel" class="panel collection-settings-panel" data-expanded="${state.collectionSettingsExpanded}"><div class="panel-header"><h2>수집 실행 설정</h2><button id="collection-settings-toggle" class="icon-button collection-settings-toggle" type="button" data-action="collection-settings-toggle" aria-expanded="${state.collectionSettingsExpanded}" aria-controls="collection-settings-form" aria-label="수집 실행 설정 ${state.collectionSettingsExpanded ? "접기" : "펼치기"}"><span aria-hidden="true">${state.collectionSettingsExpanded ? "−" : "+"}</span></button></div><form id="collection-settings-form" ${state.collectionSettingsExpanded ? "" : "hidden"}><fieldset id="collection-settings-fields" class="panel-body"><div class="collection-config-row"><label class="field">Episode 수집 목표<div class="input-unit"><input name="collection_episodes" type="number" min="1" max="100" step="1" required value="${n(goal)}" data-saved-goal="${n(goal)}" ${collectionGoalLocked() ? "disabled" : ""}><span>개</span></div></label>${numericField("episodes","Run 당 episode rollout",config.episodes ?? 1,1,100,"개")}${numericField("budget_usd","API 비용 한도",config.budget_usd ?? 15,.01,1000,"$",.01)}</div><div class="collection-config-row two">${numericField("max_steps","최대 episode 길이",config.max_steps ?? 300,1,10000,"steps")}${numericField("max_decisions","Task 당 최대 GPT 호출 횟수",config.max_decisions ?? 50,1,1000,"회")}</div><div class="collection-config-row"><label class="field">Reset 방식<select name="reset_mode"><option value="agent" ${config.reset_mode === "agent" || !config.reset_mode ? "selected" : ""}>GPT arm reset</option><option value="environment" ${config.reset_mode === "environment" ? "selected" : ""}>환경 초기화</option><option value="free_space" ${config.reset_mode === "free_space" ? "selected" : ""}>대상 복구 + 안전 후퇴 후 환경 초기화</option></select></label>${numericField("max_reset_steps","최대 reset step",config.max_reset_steps ?? 300,1,10000,"steps")}${numericField("max_reset_decisions","Reset 당 최대 GPT 호출 횟수",config.max_reset_decisions ?? 40,1,1000,"회")}</div><p id="collection-goal-summary" class="field-note"></p><p id="collection-goal-note" class="field-note"></p><p class="field-note">수집 목표에는 사용 중인 성공 task episode만 포함하며 보관·삭제 데이터는 제외합니다. BC 평가 미달로 늘어난 누적 목표는 기본 목표를 바꾸면 다시 설정됩니다.</p><p class="field-note">Run 설정은 환경 재연결 없이 다음 새 run부터 적용됩니다. 시작한 run은 Pause·재개 시에도 기존 설정을 유지합니다. 한 번만 실행은 1 episode와 reset을 수행합니다.</p><p class="field-note">안전 후퇴 모드는 시뮬레이터에서 복구·후퇴 검증 후 환경을 초기화합니다. API 비용 한도는 응답 후 확인하므로 마지막 호출 비용만큼 초과할 수 있습니다.</p></fieldset><p id="collection-settings-error" class="form-error" role="alert" hidden></p><div class="pipeline-config-actions"><p>저장만으로 환경 연결이나 수집·학습을 시작하지 않습니다.</p><button id="collection-settings-save" class="button primary" type="submit">${icon("check")}수집 설정 저장</button></div></form></section>`;
+  }
+
+  function setCollectionSettingsExpanded(expanded) {
+    state.collectionSettingsExpanded = expanded;
+    const panel = $("collection-settings-panel"), form = $("collection-settings-form"), button = $("collection-settings-toggle");
+    if (!panel || !form || !button) return;
+    panel.dataset.expanded = String(expanded);
+    form.hidden = !expanded;
+    button.setAttribute("aria-expanded", String(expanded));
+    button.setAttribute("aria-label", `수집 실행 설정 ${expanded ? "접기" : "펼치기"}`);
+    button.innerHTML = `<span aria-hidden="true">${expanded ? "−" : "+"}</span>`;
+  }
+
+  function updateCollectionSettings() {
+    if (state.route.tab !== "collection" || !$("collection-settings-panel") || !currentProject()) return;
+    const pipeline = currentPipeline(), goal = pipeline?.config?.collection_episodes;
+    const signature = JSON.stringify([currentProject().run_config || {},goal]);
+    if (!state.collectionSettingsDirty && !state.collectionSettingsSaving && signature !== state.collectionSettingsSignature) $("collection-settings-panel").outerHTML = renderCollectionSettings(currentProject());
+    const blocked = !state.connected || state.collectionSettingsSaving || Boolean(state.pipelinePending);
+    if ($("collection-settings-fields")) $("collection-settings-fields").disabled = blocked;
+    if ($("collection-settings-save")) $("collection-settings-save").disabled = blocked;
+    const input = $("collection-settings-form")?.elements?.collection_episodes;
+    if (input) {
+      if (!state.collectionSettingsSaving && typeof goal === "number" && Number(input.value) === Number(input.dataset.savedGoal)) {input.value = String(goal);input.dataset.savedGoal = String(goal);}
+      input.disabled = blocked || collectionGoalLocked();
+    }
+    const collection = pipeline?.completion?.collect || {}, target = collection.target ?? goal;
+    $("collection-goal-summary").textContent = typeof target === "number" ? `사용 중 성공 ${count(collection.completed ?? currentProject().stats?.successes)}개 · 현재 누적 목표 ${count(target)}개 · 추가 ${count(collection.remaining ?? Math.max(0,target-n(currentProject().stats?.successes)))}개 필요` : "저장된 수집 목표를 확인하고 있습니다.";
+    $("collection-goal-note").textContent = collectionGoalLocked() ? "파이프라인 실행 중이거나 목표를 불러오는 동안에는 누적 목표를 바꿀 수 없습니다. Run 실행 한도는 다음 새 run에 적용하도록 저장할 수 있습니다." : "Episode 수집 목표는 누적 성공 데이터 기준이며, Run 당 episode rollout은 한 번의 수집 실행 횟수입니다.";
+  }
+
+  async function saveCollectionSettings(event) {
+    event.preventDefault();
+    const form = event.target, project = currentProject(), token = state.routeToken;
+    if (!project || state.route.tab !== "collection" || state.collectionSettingsSaving || state.pipelinePending || !state.connected || !form.reportValidity()) return;
+    const goalInput = form.elements.collection_episodes;
+    const goal = goalInput ? Number(goalInput.value) : null;
+    const goalChanged = Boolean(goalInput) && goal !== Number(goalInput.dataset.savedGoal);
+    if (goalChanged && collectionGoalLocked()) {$("collection-settings-error").textContent = "누적 목표를 바꾸려면 파이프라인을 완료하거나 중지해주세요. 입력한 실행 설정은 유지됩니다.";$("collection-settings-error").hidden = false;return;}
+    const data = new FormData(form), config = {...project.run_config};
+    for (const key of ["episodes","budget_usd","max_steps","max_decisions","max_reset_steps","max_reset_decisions"]) config[key] = Number(data.get(key));
+    config.reset_mode = String(data.get("reset_mode"));config.task_id = project.task_id;
+    state.collectionSettingsDirty = true;state.collectionSettingsSaving = true;state.pipelinePending = "collection-settings";
+    $("collection-settings-error").hidden = true;updateCollection();
+    let goalSaved = false;
+    try {
+      if (goalChanged) {
+        const pipeline = await api(`/api/projects/${encodeURIComponent(project.id)}/pipeline/config`,{collection_episodes:goal});
+        goalSaved = true;
+        if (token === state.routeToken && state.route.id === project.id) {
+          state.pipelineRequest += 1;state.pipelineBusy = false;state.pipeline = pipeline;state.pipelineProjectId = project.id;
+          goalInput.dataset.savedGoal = String(pipeline.config?.collection_episodes ?? goal);
+        }
+      }
+      // Navigation changes the visible project, not the destination of this approved save.
+      const result = await api(`/api/projects/${encodeURIComponent(project.id)}/settings`,{run_config:config});
+      if (token !== state.routeToken || state.route.id !== project.id) return;
+      state.detail.project = result.project;state.collectionSettingsDirty = false;
+      toast("수집 설정을 저장했습니다. Run 설정은 다음 새 run부터 적용하며 현재 run과 Pause·재개 설정은 유지합니다.");
+      await refreshStatus(true);
+    } catch (error) {
+      const message = `${goalSaved ? "누적 수집 목표는 저장했지만 Run 실행 설정을 저장하지 못했습니다. 입력값을 확인한 뒤 다시 저장해주세요. " : "수집 실행 설정을 저장하지 못했습니다. "}${error.message}`;
+      if (token === state.routeToken && $("collection-settings-error")) {setCollectionSettingsExpanded(true);$("collection-settings-error").textContent = message;$("collection-settings-error").hidden = false;}
+      else toast(message,true);
+    } finally {
+      state.collectionSettingsSaving = false;
+      if (state.pipelinePending === "collection-settings") state.pipelinePending = null;
+      if (token === state.routeToken) updateCollection();
+    }
+  }
+
+  const episodeSelectionKey = (episode) => JSON.stringify([episode.run_id,episode.id]);
+  const canSelectEpisode = (episode, mode) => episode.can_manage === true && (mode === "delete" || !episode.delete_pending);
+  const currentDataSelection = () => state.dataSelection?.project === state.route.id && state.route.tab === "data" && state.dataSelection.view === state.dataView ? state.dataSelection : null;
+
+  function visibleDataEpisodes() {
+    const episodes = state.dataView === "archived" ? state.detail?.archived_episodes || [] : state.detail?.episodes || [];
+    return episodes.filter(ep => {
+      if (state.filter === "all") return true;
+      if (state.filter === "complete") return complete(ep);
+      if (state.filter === "incomplete") return ep.outcome && (ep.outcome !== "success" || !externalEpisode(ep) && !complete(ep));
+      if (state.filter === "task_success") return ep.outcome === "success";
+      return ep.outcome === "success" && qualityKey(ep,"task") === state.filter;
+    }).slice().sort((a,b) => n(b.started_at)-n(a.started_at));
+  }
+
+  function selectedDataEpisodes() {
+    const selection = currentDataSelection();
+    return selection ? visibleDataEpisodes().filter(ep => canSelectEpisode(ep,selection.mode) && selection.selected.has(episodeSelectionKey(ep))) : [];
+  }
+
+  function bulkEpisodeToolbar(episodes) {
+    const selection = currentDataSelection(), busy = Boolean(state.episodeMutation);
+    if (selection) {
+      const allowed = new Set(episodes.filter(ep => canSelectEpisode(ep,selection.mode)).map(episodeSelectionKey));
+      selection.selected.forEach(key => {if (!allowed.has(key)) selection.selected.delete(key);});
+    }
+    const archiveWord = state.dataView === "archived" ? "보관 해제" : "보관";
+    return `<div class="episode-bulk-toolbar"><span id="episode-bulk-status" role="status"></span><div class="episode-bulk-buttons">${["archive","delete"].map(mode => {
+      const active = selection?.mode === mode, word = mode === "delete" ? "삭제" : archiveWord;
+      const unavailable = busy || (active ? !selection.selected.size : !episodes.some(ep => canSelectEpisode(ep,mode)));
+      return `<button id="episode-bulk-${mode}" type="button" class="button small ${mode === "delete" ? "danger" : "secondary"}" data-action="bulk-episode-select" data-mode="${mode}" aria-pressed="${active}" ${unavailable ? "disabled" : ""}>${icon(mode === "delete" ? "trash" : state.dataView === "archived" ? "restore" : "archive")}${active ? "일괄" : "선택"} ${word}</button>`;
+    }).join("")}${selection ? `<button type="button" class="button quiet small" data-action="bulk-episode-cancel" ${busy ? "disabled" : ""}>취소</button>` : ""}</div></div>${selection?.error ? `<p class="form-error episode-bulk-error" role="alert">${esc(selection.error)}</p>` : ""}`;
+  }
+
+  function updateBulkEpisodeControls() {
+    const selection = currentDataSelection(), busy = Boolean(state.episodeMutation);
+    const eligible = selection ? visibleDataEpisodes().filter(ep => canSelectEpisode(ep,selection.mode)) : [];
+    const selected = selectedDataEpisodes().length;
+    const status = $("episode-bulk-status");
+    if (status) status.textContent = state.bulkEpisodeBusy?.project === state.route.id ? `${state.bulkEpisodeBusy.done} / ${state.bulkEpisodeBusy.total}개 처리 중…` : selection ? `${selected}개 선택` : "";
+    const all = $("episode-select-all");
+    if (all) {all.checked = eligible.length > 0 && selected === eligible.length;all.indeterminate = selected > 0 && selected < eligible.length;all.disabled = busy || !eligible.length;}
+    if (selection) {
+      const button = $(`episode-bulk-${selection.mode}`);if (button) button.disabled = busy || !selected;
+      document.querySelectorAll("input[data-episode-select]").forEach(input => {
+        const ep = findEpisode(input.dataset.run,input.dataset.episode);
+        input.checked = selection.selected.has(JSON.stringify([input.dataset.run,input.dataset.episode]));
+        input.disabled = busy || !ep || !canSelectEpisode(ep,selection.mode);
+        input.closest("tr")?.classList.toggle("episode-selected",input.checked);
+      });
+    }
+  }
+
+  function toggleEpisodeSelection(input) {
+    const selection = currentDataSelection();
+    if (!selection || state.episodeMutation) return;
+    const episodes = visibleDataEpisodes().filter(ep => canSelectEpisode(ep,selection.mode));
+    const targets = input.id === "episode-select-all" ? episodes : episodes.filter(ep => ep.run_id === input.dataset.run && ep.id === input.dataset.episode);
+    targets.forEach(ep => {const key = episodeSelectionKey(ep);if (input.checked) selection.selected.add(key);else selection.selected.delete(key);});
+    selection.error = null;updateBulkEpisodeControls();
+  }
+
+  function selectBulkEpisodes(mode) {
+    const project = currentProject();
+    if (!project || state.route.tab !== "data" || state.episodeMutation || !["archive","delete"].includes(mode)) return;
+    const selection = currentDataSelection();
+    if (selection?.mode === mode) {
+      const episodes = selectedDataEpisodes();
+      if (!episodes.length) return;
+      const target = {project:project.id,routeToken:state.routeToken,view:state.dataView,mode,items:episodes.map(ep => ({run:ep.run_id,id:ep.id,label:episodeLabel(ep),key:episodeSelectionKey(ep)}))};
+      if (mode === "archive") {mutateBulkEpisodes(target);return;}
+      state.bulkEpisodeTarget = target;
+      $("bulk-episode-info").innerHTML = `<strong>${esc(project.name)} · ${episodes.length}개 선택</strong><ul>${target.items.map(item => `<li>${esc(item.label)}</li>`).join("")}</ul>`;
+      $("bulk-episode-confirm").disabled = false;$("bulk-episode-confirm").textContent = `${episodes.length}개 일괄 삭제`;
+      $("bulk-episode-dialog").showModal();
+      return;
+    }
+    state.dataSelection = {project:project.id,view:state.dataView,mode,selected:new Set(),error:null};
+    renderData(project);
+  }
+
+  async function mutateBulkEpisodes(target = state.bulkEpisodeTarget) {
+    if (!target || state.episodeMutation || target.project !== state.route.id || target.routeToken !== state.routeToken || state.route.tab !== "data" || target.view !== state.dataView || !target.items.length) return;
+    if (target.mode === "delete" && (!$("bulk-episode-dialog").open || target !== state.bulkEpisodeTarget)) return;
+    const selection = currentDataSelection(), failures = [];
+    let batchDetail = state.detail;
+    state.episodeMutation = "bulk";
+    const progress = state.bulkEpisodeBusy = {project:target.project,done:0,total:target.items.length};
+    $("bulk-episode-confirm").disabled = true;$("bulk-episode-confirm").textContent = "삭제 중…";
+    renderData(currentProject());
+    try {
+      for (const [index,item] of target.items.entries()) {
+        try {
+          const latest = state.detail?.project?.id === target.project ? state.detail : batchDetail;
+          const episode = [...(latest?.episodes || []),...(latest?.archived_episodes || [])].find(ep => ep.run_id === item.run && ep.id === item.id);
+          if (!episode || !canSelectEpisode(episode,target.mode)) {
+            failures.push(`${item.label}: ${episode?.manage_disabled_reason || "현재 관리할 수 없는 데이터입니다."}`);
+            progress.done += 1;
+            continue;
+          }
+          const detail = await api(`${episodePath(target.project,item.run,item.id)}/${target.mode}`,target.mode === "delete" ? {confirm:true} : {archived:target.view !== "archived"},30000);
+          batchDetail = detail;
+          selection?.selected.delete(item.key);
+          if (state.route.id === target.project) {state.detail = detail;state.detailSignature = "";}
+          if (target.mode === "delete" && state.episodeDetail?.run === item.run && state.episodeDetail?.id === item.id) $("episode-dialog").close();
+        } catch (error) {
+          failures.push(`${item.label}: ${error.message}`);
+          if (!error.status) {
+            failures.push(...target.items.slice(index+1).map(next => `${next.label}: 연결 오류로 요청하지 않았습니다.`));
+            break;
+          }
+        }
+        progress.done += 1;
+        if (state.route.id === target.project && state.route.tab === "data") renderData(currentProject());
+      }
+    } finally {
+      state.episodeMutation = null;state.bulkEpisodeBusy = null;state.bulkEpisodeTarget = null;
+      $("bulk-episode-dialog").close();
+      if (selection && state.dataSelection === selection) {
+        if (failures.length) selection.error = `${target.items.length - failures.length}개 처리 완료 · ${failures.length}개 처리 실패. ${failures.join(" / ")}`;
+        else state.dataSelection = null;
+      }
+      const verb = target.mode === "delete" ? "삭제" : target.view === "archived" ? "보관 해제" : "보관";
+      toast(failures.length ? `${target.items.length - failures.length}개 ${verb} 완료 · ${failures.length}개 실패. 데이터 목록에서 확인해주세요.` : `${target.items.length}개 데이터를 ${verb}했습니다.`,failures.length > 0);
+      if (state.route.id === target.project && state.route.tab === "data") renderData(currentProject());
+      await refreshWorkspace();
+    }
   }
 
   function renderData(project) {
     const archived = state.dataView === "archived";
-    const episodes = (archived ? state.detail.archived_episodes || [] : state.detail.episodes || []).slice().sort((a,b) => n(b.started_at)-n(a.started_at));
-    const filtered = episodes.filter(ep => state.filter === "all" || (state.filter === "complete" ? complete(ep) : state.filter === "incomplete" ? ep.outcome && !complete(ep) : ep.outcome === "success"));
-    $("tab-content").innerHTML = `<div class="data-toolbar"><div><h2>${archived ? "보관함" : "수집 데이터"}</h2><p>${archived ? "보관한 episode는 대시보드 demo 수와 기본 목록에서 제외됩니다." : `${count(project.stats?.runs)} runs · ${count(project.stats?.episodes)} episodes · 데이터와 GPT 판단 기록`}</p></div><select id="episode-filter" class="filter-select" aria-label="Episode 결과 필터"><option value="all">전체 episodes</option><option value="complete">Task + Reset 완료</option><option value="incomplete">실패 / 복구 미완료</option><option value="task_success">Task 성공</option></select></div><div class="data-view-switch" role="group" aria-label="데이터 표시 범위"><button class="${!archived ? "selected" : ""}" data-action="data-active" aria-pressed="${!archived}">${icon("database")}데이터 <span>${count(project.stats?.episodes)}</span></button><button class="${archived ? "selected" : ""}" data-action="data-archived" aria-pressed="${archived}">${icon("archive")}보관함 <span>${count(project.archived_count ?? state.detail.archived_episodes?.length)}</span></button></div><section class="panel">${episodesTable(filtered)}</section><p class="home-footnote">${icon("info")}${archived ? "보관 해제로 데이터 목록에 다시 표시할 수 있습니다. 보관은 원본 기록과 영상을 유지합니다." : "보관 아이콘은 데이터를 숨기고, 휴지통은 확인 후 episode 기록과 영상을 영구 삭제합니다."}</p><p class="home-footnote billing-note">이미 발생한 API 비용과 토큰 사용량은 보관·삭제 후에도 누적 사용 비용에 포함됩니다.</p>`;
+    const filtered = visibleDataEpisodes();
+    $("tab-content").innerHTML = `<div class="data-toolbar"><div><h2>${archived ? "보관함" : "수집 데이터"}</h2><p>${archived ? "보관한 episode는 대시보드 demo 수와 기본 목록에서 제외됩니다." : `${count(project.stats?.runs)} runs · ${count(project.stats?.episodes)} episodes · 데이터와 GPT 판단 기록`}</p></div><select id="episode-filter" class="filter-select" aria-label="Episode 결과 필터"><option value="all">전체 episodes</option><option value="complete">Task + Reset 완료</option><option value="incomplete">실패 / 복구 미완료</option><option value="task_success">Task 성공 · 전체</option><option value="within_grasp_budget">Task 성공 · Optimal</option><option value="extra_grasp_attempts">Task 성공 · Sub-optimal</option><option value="unknown">Task 성공 · 분류 정보 없음</option></select></div><div class="data-view-switch" role="group" aria-label="데이터 표시 범위"><button class="${!archived ? "selected" : ""}" data-action="data-active" aria-pressed="${!archived}">${icon("database")}데이터 <span>${count(project.stats?.episodes)}</span></button><button class="${archived ? "selected" : ""}" data-action="data-archived" aria-pressed="${archived}">${icon("archive")}보관함 <span>${count(project.archived_count ?? state.detail.archived_episodes?.length)}</span></button></div><section class="panel episode-data-panel">${bulkEpisodeToolbar(filtered)}${episodesTable(filtered)}</section><p class="home-footnote">${icon("info")}${archived ? "보관 해제로 데이터 목록에 다시 표시할 수 있습니다. 보관은 원본 기록과 영상을 유지합니다." : "보관 아이콘은 데이터를 숨기고, 휴지통은 확인 후 episode 기록과 영상을 영구 삭제합니다."}</p><p class="home-footnote billing-note">데이터 사용 비용과 토큰 사용량은 사용 중·보관 중 episode의 합계입니다. 삭제한 episode는 집계에서 제외됩니다.</p>`;
     $("episode-filter").value = state.filter;
+    updateBulkEpisodeControls();
   }
 
-  function renderModels(project) {
-    state.modelSignature = "";state.evaluationSignature = "";state.pipelineConfigSignature = "";state.pipelineExecutionSignature = "";
-    $("tab-content").innerHTML = `<div class="learning-heading"><div><h2>모델과 학습 파이프라인</h2><p>데이터 수집부터 평가까지 단계별 상태와 실제 학습 결과를 확인하세요.</p></div><span id="learning-connection" class="tag neutral">상태 확인 중</span></div><div id="pipeline-unavailable" hidden></div><div id="pipeline-workspace"><section class="panel pipeline-execution-panel"><div class="panel-header"><div><h2>파이프라인 실행</h2><p>실행 버튼을 누르기 전에는 학습이나 rollout을 시작하지 않습니다.</p></div><div id="pipeline-phase-tag"></div></div><div class="pipeline-mode-switch" role="group" aria-label="파이프라인 실행 방식"><button id="pipeline-mode-auto" data-action="pipeline-mode-auto" class="selected" aria-pressed="true">${icon("flow")}전체 자동 실행</button><button id="pipeline-mode-manual" data-action="pipeline-mode-manual" aria-pressed="false">${icon("step")}단계별 실행</button></div><div id="pipeline-execution"></div><div id="pipeline-stages" class="pipeline-stage-list"></div></section><div id="pipeline-monitor"></div><section class="panel evaluation-panel"><div class="panel-header"><div><h2>정책 성능 비교</h2><p>실제로 완료된 BC-only / BC+Residual 평가 결과</p></div></div><div id="pipeline-evaluations"></div></section><section class="panel model-registry-panel"><div class="panel-header"><div><h2>모델 레지스트리</h2><p>체크포인트, 학습 데이터와 적용된 설정</p></div><span id="model-count" class="tag neutral">0</span></div><div id="pipeline-models"></div></section><section class="panel pipeline-config-panel"><div class="panel-header"><div><h2>학습 설정</h2><p>저장한 설정은 다음 단계 실행부터 적용됩니다.</p></div><span id="pipeline-config-state" class="tag neutral">저장된 설정</span></div><div id="pipeline-config"></div></section></div>`;
-    updatePipelineView(true);
-    refreshPipeline(true);
+  const episodeVideoUnavailableMessage = "현재 서버에 episode 영상 기능이 반영되지 않았습니다. RILO 서버를 재시작한 뒤 새로고침해주세요.";
+
+  function setEpisodeVideoError(detail, error) {
+    detail.videoApiUnavailable = error.status === 404 && error.detail === "Not Found";
+    detail.videoError = detail.videoApiUnavailable ? episodeVideoUnavailableMessage : error.message;
+  }
+
+  function episodeVideoBlockedReason(detail) {
+    if (!detail) return "Episode를 선택해주세요.";
+    if (detail.videoApiUnavailable) return episodeVideoUnavailableMessage;
+    if (!state.connected) return "서버 연결을 확인해주세요.";
+    const learning = pipelineRuntime();
+    if (learning && pipelineActive(learning.phase) && learning.project_id === detail.project) return "이 프로젝트의 파이프라인을 중지한 뒤 영상을 관리할 수 있습니다.";
+    const status = state.status || {};
+    if (status.run_id === detail.run && activePhases.has(status.phase)) return "현재 run이 끝나거나 중지된 뒤 영상을 관리할 수 있습니다.";
+    const episode = findEpisode(detail.run,detail.id) || detail.episode;
+    return episode?.can_manage === false || episode?.delete_pending ? episode.manage_disabled_reason || "Episode 기록을 정리한 뒤 영상을 관리할 수 있습니다." : "";
+  }
+
+  function updateEpisodeVideo() {
+    const detail = state.episodeDetail, panel = $("episode-video-actions"), player = $("episode-video-player");
+    if (!detail || !$("episode-dialog").open || !panel || !player) return;
+    const ep = findEpisode(detail.run,detail.id) || detail.episode || {}, job = detail.videoJob;
+    const video = asset(ep.video_url), poster = asset(ep.poster_url), signature = `${video}|${poster}`;
+    if (player.dataset.mediaSignature !== signature) {
+      player.querySelector("video")?.pause();
+      player.dataset.mediaSignature = signature;
+      player.innerHTML = video ? `<video controls playsinline preload="metadata" src="${esc(video)}" ${poster ? `poster="${esc(poster)}"` : ""}></video><p class="episode-video-note">시뮬레이션 시간 기준 영상 · GPT 추론 대기는 제외됩니다.</p>` : '<div class="episode-video-empty">이 episode의 영상이 아직 생성되지 않았습니다.</div>';
+    }
+    const busy = ["queued","running"].includes(job?.state), reason = episodeVideoBlockedReason(detail);
+    const controlsSignature = JSON.stringify([video,job,reason,detail.videoMutation,detail.videoError]);
+    if (panel.dataset.controlsSignature === controlsSignature) return;
+    panel.dataset.controlsSignature = controlsSignature;
+    const status = detail.videoMutation === "delete" ? "영상을 삭제하고 있습니다." : detail.videoMutation ? "영상 생성을 요청하고 있습니다." : detail.videoError ? detail.videoError : job?.state === "error" ? job.error || "영상 생성에 실패했습니다. 다시 시도할 수 있습니다." : busy ? job.state === "queued" ? "이 episode의 영상 생성 대기 중입니다." : "이 episode의 영상을 생성하고 있습니다." : reason || (video ? "영상만 삭제할 수 있습니다. Episode의 관측·action·성공 기록은 유지됩니다." : "저장된 관측으로 이 episode의 영상을 생성합니다. 로봇 실행이나 GPT 호출은 발생하지 않습니다.");
+    panel.innerHTML = `<div class="episode-video-controls">${video ? `<button class="button danger small" data-action="delete-episode-video" ${reason || busy || detail.videoMutation ? "disabled" : ""}>${icon("trash")}영상 삭제</button><a href="${esc(video)}" download class="button secondary small">${icon("download")}MP4 다운로드</a>` : `<button class="button secondary" data-action="generate-episode-video" ${reason || busy || detail.videoMutation || job?.state === "completed" ? "disabled" : ""}>${icon("camera")}${busy ? "영상 생성 중…" : "영상 생성"}</button>`}</div><p class="${detail.videoError || job?.state === "error" ? "form-error" : "field-note"}" role="status">${esc(status)}</p>`;
+  }
+
+  async function refreshEpisodeVideoJob() {
+    const detail = state.episodeDetail, token = state.episodeToken;
+    if (!detail || !$("episode-dialog").open || detail.videoBusy || detail.videoMutation) return;
+    const request = ++detail.videoRequest;
+    detail.videoBusy = true;
+    try {
+      const result = await api(`${episodePath(detail.project,detail.run,detail.id)}/video`);
+      if (token !== state.episodeToken || request !== detail.videoRequest) return;
+      const previous = detail.videoJob?.state;
+      detail.videoJob = result.video_job || null;detail.videoError = null;detail.videoApiUnavailable = false;
+      if (detail.videoJob?.state === "completed" && (previous !== "completed" || !(findEpisode(detail.run,detail.id) || detail.episode)?.video_url)) await loadDetail(false);
+      if (token === state.episodeToken && request === detail.videoRequest) updateEpisodeVideo();
+    } catch (error) {
+      if (token === state.episodeToken && request === detail.videoRequest) {setEpisodeVideoError(detail,error);updateEpisodeVideo();}
+    } finally {if (request === detail.videoRequest) detail.videoBusy = false;}
+  }
+
+  async function mutateEpisodeVideo(action) {
+    const detail = state.episodeDetail, token = state.episodeToken;
+    if (!detail || detail.videoMutation || ["queued","running"].includes(detail.videoJob?.state) || episodeVideoBlockedReason(detail)) return;
+    const ep = findEpisode(detail.run,detail.id) || detail.episode;
+    if (action === "generate" && (ep?.video_url || detail.videoJob?.state === "completed") || action === "delete" && !ep?.video_url) return;
+    const request = ++detail.videoRequest;
+    detail.videoMutation = action;detail.videoBusy = false;detail.videoError = null;updateEpisodeVideo();
+    try {
+      const result = await api(`${episodePath(detail.project,detail.run,detail.id)}/video${action === "delete" ? "/delete" : ""}`,{});
+      if (token !== state.episodeToken || request !== detail.videoRequest) return;
+      detail.videoJob = result.video_job || {state:"idle"};detail.videoApiUnavailable = false;
+      if (action === "delete") {
+        ep.video_url = null;ep.poster_url = null;
+        toast("영상만 삭제했습니다. Episode 데이터는 유지됩니다.");
+      } else toast("이 episode의 영상 생성을 요청했습니다.");
+      if (action === "delete" || detail.videoJob?.state === "completed") await loadDetail(false);
+    } catch (error) {
+      if (token === state.episodeToken && request === detail.videoRequest) setEpisodeVideoError(detail,error);
+    } finally {if (token === state.episodeToken && request === detail.videoRequest) {detail.videoMutation = null;updateEpisodeVideo();}}
+  }
+
+  function renderEvaluationLive() {
+    state.evaluationCameraSignature = "";state.evaluationObservationKey = "";state.evaluationFrameToken += 1;state.evaluationDisplayedContext = null;
+    return `<section id="evaluation-live-panel" class="panel evaluation-live-panel"><div class="panel-header"><div><h2>평가 rollout 화면</h2><p id="evaluation-live-subtitle">이 프로젝트의 BC 또는 RL 평가 관측을 표시합니다.</p></div><span id="evaluation-live-state" class="tag neutral">평가 대기</span></div><div id="evaluation-live-images"></div><dl class="evaluation-live-context"><div><dt>정책</dt><dd id="evaluation-live-policy">—</dd></div><div><dt>Rollout</dt><dd id="evaluation-live-episode">—</dd></div><div><dt>Task / Reset step</dt><dd id="evaluation-live-steps">—</dd></div><div><dt>현재 동작</dt><dd id="evaluation-live-stage">—</dd></div><div><dt>평가 Reset</dt><dd id="evaluation-live-reset">—</dd></div><div><dt>Run</dt><dd id="evaluation-live-run">—</dd></div></dl><p id="evaluation-live-note" class="evaluation-live-note"></p></section>`;
+  }
+
+  function evaluationLiveSource(allowInitializing = false) {
+    const status = state.status, project = currentProject();
+    if (state.route.tab !== "evaluation" || !state.connected || !status || !project || status.active_project_id !== project.id || !status.run_id || !status.observation?.id) return null;
+    if (!["ready","thinking","executing","pausing","paused","completed","stopped","error"].includes(status.phase) && !(allowInitializing && status.phase === "initializing")) return null;
+    const stage = status.learning?.pipeline_stage;
+    if (!["bc_eval","rl_eval"].includes(stage)) return null;
+    const pipeline = currentPipeline()?.status;
+    if (pipeline?.job_id && status.learning?.job_id && pipeline.job_id !== status.learning.job_id) return null;
+    if (pipelineActive(pipeline?.phase)) {
+      if (pipeline.stage && pipeline.stage !== stage) return null;
+      const started = [...(pipeline.events || [])].reverse().find(event => event.message === `${stage} 단계 시작`)?.time;
+      if (typeof started === "number" && typeof status.episode?.started_at === "number" && status.episode.started_at < started) return null;
+    }
+    return status;
+  }
+
+  function updateEvaluationLive() {
+    if (state.route.tab !== "evaluation" || !$("evaluation-live-images")) return;
+    const status = evaluationLiveSource(), holder = $("evaluation-live-images");
+    const preparing = !status && evaluationLiveSource(true), displayed = state.evaluationDisplayedContext;
+    if (preparing?.phase === "initializing" && displayed
+        && displayed.projectId === preparing.active_project_id && displayed.runId === preparing.run_id
+        && displayed.stage === preparing.learning.pipeline_stage && displayed.jobId === preparing.learning.job_id
+        && displayed.cameraSignature === state.evaluationCameraSignature) {
+      // Keep the last image through the same run's reset; never reuse another run's frames.
+      state.evaluationObservationKey = "";state.evaluationFrameToken += 1;
+      $("evaluation-live-state").textContent = "다음 rollout 준비 중";$("evaluation-live-state").className = "tag neutral";
+      $("evaluation-live-stage").textContent = "Reset 준비";
+      $("evaluation-live-note").textContent = "환경을 준비하는 동안 마지막 평가 이미지를 유지합니다. 다음 관측이 도착하면 갱신됩니다.";
+      return;
+    }
+    if (!status) {
+      const key = state.connected ? "empty" : "offline";
+      if (state.evaluationCameraSignature !== key) {
+        holder.innerHTML = `<div class="evaluation-live-empty">${icon("camera")}<strong>${state.connected ? "표시할 평가 관측이 없습니다" : "서버 연결을 확인하고 있습니다"}</strong><p>이 프로젝트의 BC 또는 RL 평가를 실행하면 카메라 화면이 표시됩니다.</p></div>`;
+        state.evaluationCameraSignature = key;state.evaluationObservationKey = "";state.evaluationFrameToken += 1;state.evaluationDisplayedContext = null;
+      }
+      $("evaluation-live-state").textContent = state.connected ? "평가 대기" : "연결 확인";$("evaluation-live-state").className = "tag neutral";
+      $("evaluation-live-subtitle").textContent = "이 프로젝트의 BC 또는 RL 평가 관측을 표시합니다.";
+      for (const field of ["policy","episode","steps","stage","reset","run"]) $("evaluation-live-"+field).textContent = "—";
+      $("evaluation-live-note").textContent = "다른 프로젝트나 수집 run의 관측은 표시하지 않습니다.";
+      return;
+    }
+    const observation = status.observation, episode = status.episode || {}, stage = status.learning.pipeline_stage;
+    const policy = stage === "rl_eval" ? "BC + Residual" : "BC only";
+    const finished = ["completed","stopped","error"].includes(status.phase);
+    const stateLabel = status.phase === "paused" ? "평가 일시정지" : finished ? status.phase === "completed" ? "마지막 평가 관측" : "중단된 평가 관측" : "평가 진행 중";
+    $("evaluation-live-state").textContent = stateLabel;$("evaluation-live-state").className = `tag ${status.phase === "paused" || ["stopped","error"].includes(status.phase) ? "warning" : finished ? "neutral" : "success"}`;
+    const phaseLabel = status.phase === "thinking" && status.stage !== "reset" ? "정책 action 계산 중" : phaseNames[status.phase] || status.phase;
+    $("evaluation-live-subtitle").textContent = `${currentProject().name} · ${policy} · ${phaseLabel}`;
+    $("evaluation-live-policy").textContent = policy;
+    $("evaluation-live-episode").textContent = `${episodeLabel({...episode,run_id:status.run_id,learning:status.learning})} · run ${count(episode.index)} / ${count(status.config?.episodes)}`;
+    $("evaluation-live-steps").textContent = `${count(episode.steps)} / ${count(episode.reset_steps)}`;
+    $("evaluation-live-stage").textContent = status.stage === "reset" ? "Reset" : "Task rollout";
+    $("evaluation-live-reset").textContent = ["agent","environment","free_space"].includes(status.config?.reset_mode) ? resetModeLabel(status.config.reset_mode) : "기록 없음";
+    $("evaluation-live-run").textContent = status.run_id;
+    $("evaluation-live-note").textContent = `상태 확인 ${date(observation.timestamp,{second:"2-digit"})} · 카메라는 같은 평가 run의 최신 화면이며 상태 정보는 주기적으로 갱신됩니다.`;
+    const cameras = (Array.isArray(observation.cameras) ? observation.cameras.map(item => typeof item === "string" ? item : item.name) : Object.keys(observation.cameras || {})).filter(name => typeof name === "string" && name && !/^reset_reference(?:_|$)/.test(name));
+    const cameraSignature = JSON.stringify([status.active_project_id,status.run_id,stage,cameras]);
+    if (cameraSignature !== state.evaluationCameraSignature) {
+      holder.innerHTML = cameras.length ? `<div class="camera-grid ${cameras.length === 1 ? "single" : ""}">${cameras.map((camera,index) => `<div class="camera"><span class="camera-label">${esc(camera)}</span><div id="evaluation-frame-${index}" class="evaluation-frame-slot"><span>관측 수신 대기</span></div></div>`).join("")}</div>` : '<div class="evaluation-live-empty"><p>평가 카메라를 기다리고 있습니다.</p></div>';
+      state.evaluationCameraSignature = cameraSignature;state.evaluationObservationKey = "";
+    }
+    const observationKey = `${cameraSignature}|${observation.id}`;
+    if (observationKey === state.evaluationObservationKey) return;
+    state.evaluationObservationKey = observationKey;
+    const token = ++state.evaluationFrameToken;
+    cameras.forEach((camera,index) => {
+      const frame = new Image();
+      frame.alt = `${camera} ${policy} 평가 관측`;
+      frame.onload = () => {
+        const current = evaluationLiveSource();
+        if (token !== state.evaluationFrameToken || !current || current.run_id !== status.run_id || current.active_project_id !== status.active_project_id || current.learning.pipeline_stage !== stage) return;
+        const slot = $("evaluation-frame-"+index);
+        if (slot) {
+          slot.replaceChildren(frame);
+          state.evaluationDisplayedContext = {projectId:status.active_project_id,runId:status.run_id,
+            stage,jobId:status.learning.job_id,cameraSignature};
+        }
+      };
+      frame.onerror = () => {if (token === state.evaluationFrameToken) state.evaluationObservationKey = "";};
+      frame.src = `/api/frame/${encodeURIComponent(camera)}?project_id=${encodeURIComponent(status.active_project_id)}&run_id=${encodeURIComponent(status.run_id)}&t=${encodeURIComponent(observation.id)}`;
+    });
+  }
+
+  function evaluationResetField(mode = "inherit") {
+    const options = [["inherit","수집 설정 따르기"],["agent","GPT arm reset"],["environment","환경 reset"],["free_space","복구·후퇴 후 환경 초기화"]];
+    return `<label class="field">평가 Reset 방식<select name="evaluation_reset_mode">${options.map(([value,label]) => `<option value="${value}" ${value === mode ? "selected" : ""}>${label}</option>`).join("")}</select></label>`;
+  }
+
+  function evaluationResetProtocol(item) {
+    const mode = item?.reset_mode ?? item?.provenance?.evaluation?.run_config?.reset_mode;
+    return ["agent","environment","free_space"].includes(mode) ? resetModeLabel(mode) : "Reset 방식 기록 없음";
+  }
+
+  function renderModels(project) { renderLearningTab(project,false); }
+  function renderEvaluation(project) { renderLearningTab(project,true); }
+
+  function renderLearningTab(project, evaluation) {
+    state.modelSignature = "";state.evaluationSignature = "";state.pipelineExecutionSignature = "";
+    const heading = evaluation ? "정책 평가" : "모델 학습";
+    const description = evaluation ? "완료된 평가 결과를 비교하고, 정책별 rollout을 실행하세요." : "BC와 RL의 학습 설정을 확인하고 각 단계의 지표와 기록을 살펴보세요.";
+    const stageSummary = `<section class="panel learning-stage-summary"><div class="panel-header"><div><h2>학습 진행 상황</h2><p>BC와 RL의 학습 상태를 확인하세요.</p></div><span id="pipeline-phase-tag"></span></div><div id="pipeline-stages" class="pipeline-stage-list learning-stage-list"></div><div id="training-pipeline-controls"></div></section>`;
+    const registry = `<section class="panel model-registry-panel"><div class="panel-header"><div><h2>모델 레지스트리</h2><p>정책과 RL 보조 모델의 체크포인트·학습 데이터·설정</p></div><span id="model-count" class="tag neutral">0</span></div><div id="pipeline-models"></div></section>`;
+    const training = `${stageSummary}<section class="panel training-execution-panel"><div class="panel-header"><div><h2>BC 학습</h2><p>성공 task 데이터로 기본 정책을 학습합니다.</p></div></div><div id="training-bc-execution"></div></section><div id="training-bc-monitor"></div><section class="panel training-execution-panel"><div class="panel-header"><div><h2>RL 학습</h2><p>BC 정책을 고정하고 Residual 정책을 학습합니다.</p></div></div><div id="training-rl-execution"></div></section><div id="training-rl-monitor"></div>${registry}`;
+    const evaluations = `<section class="panel evaluation-panel"><div class="panel-header"><div><h2>평가 결과와 기록</h2><p>완료된 BC-only / BC+Residual 평가의 성공률과 실행 조건</p></div></div><div id="pipeline-evaluations"></div></section><section class="panel pipeline-execution-panel"><div class="panel-header"><div><h2>개별 평가 실행</h2><p>실행 전에 episode 수·목표 성공률·Reset 방식을 설정합니다.</p></div><span id="pipeline-phase-tag"></span></div><div id="pipeline-execution"></div></section>${evaluation ? renderEvaluationLive() : ""}<div id="pipeline-monitor"></div>`;
+    $("tab-content").innerHTML = `<div class="learning-heading"><div><h2>${heading}</h2><p>${description}</p></div><span id="learning-connection" class="tag neutral">상태 확인 중</span></div><div id="pipeline-unavailable" hidden></div><div id="pipeline-workspace">${evaluation ? evaluations : training}</div>`;
+    updatePipelineView();updateEvaluationLive();refreshPipeline(true);
   }
 
   function pipelineReadiness(stage) {
@@ -243,79 +760,274 @@
   function updatePipelineView(forceConfig = false) {
     const pipeline = currentPipeline(), project = currentProject();
     if (!project) return;
+    if (state.route.tab === "collection") {updateCollectionSettings();return;}
     if (state.route.tab === "overview") {
       const panel = document.querySelector(".pipeline-panel");
       if (panel) panel.outerHTML = renderPipeline(project);
       return;
     }
-    if (state.route.tab !== "models" || !$("pipeline-workspace")) return;
+    if (!["models","evaluation"].includes(state.route.tab) || !$("pipeline-workspace")) return;
     const unavailable = pipeline?.unavailable === true || (!pipelineEnabled() && !pipeline);
-    $("pipeline-unavailable").hidden = !unavailable;
-    $("pipeline-workspace").hidden = unavailable;
+    $("pipeline-unavailable").hidden = !unavailable;$("pipeline-workspace").hidden = unavailable;
     $("learning-connection").textContent = unavailable ? "학습 worker 연결 전" : pipeline ? "파이프라인 연결됨" : "상태 확인 중";
     $("learning-connection").className = `tag ${pipeline && !unavailable ? "success" : "neutral"}`;
     if (unavailable) {
-      $("pipeline-unavailable").innerHTML = `<section class="panel"><div class="empty-models"><div class="empty-model-icon">${icon("model")}</div><h2>학습 worker 연결을 기다리고 있습니다</h2><p>DP·Progress·Residual RL 파이프라인은 서버 연결 후 사용할 수 있습니다. 기존 데이터와 수집 기능은 계속 확인할 수 있습니다.</p><button class="button secondary" data-action="pipeline-refresh">${icon("reset")}상태 다시 확인</button></div></section>`;
+      $("pipeline-unavailable").innerHTML = `<section class="panel"><div class="empty-models"><div class="empty-model-icon">${icon("model")}</div><h2>학습 worker 연결을 기다리고 있습니다</h2><p>BC·RL 학습과 평가는 서버 연결 후 사용할 수 있습니다.</p><button class="button secondary" data-action="pipeline-refresh">${icon("reset")}상태 다시 확인</button></div></section>`;
       return;
     }
     if (!pipeline) {
-      $("pipeline-execution").innerHTML = '<p class="learning-empty">파이프라인 상태와 실행 조건을 불러오고 있습니다.</p>';
+      const target = $("pipeline-execution") || $("training-bc-execution");
+      if (target) target.innerHTML = '<p class="learning-empty">파이프라인 상태와 실행 조건을 불러오고 있습니다.</p>';
       return;
     }
     const status = pipeline.status || {}, phase = status.phase || "idle";
     $("pipeline-phase-tag").innerHTML = tag(pipelinePhaseNames[phase] || phase,phase === "running" ? "success" : ["error","interrupted","paused"].includes(phase) ? "warning" : "neutral");
-    updatePipelineExecution();
-    updatePipelineStages();
-    renderPipelineMonitor();
-    const modelSignature = JSON.stringify(pipeline.models || []);
-    if (modelSignature !== state.modelSignature) {state.modelSignature = modelSignature;renderModelRegistry();}
-    const evalSignature = JSON.stringify(pipeline.evaluations || []);
-    if (evalSignature !== state.evaluationSignature) {state.evaluationSignature = evalSignature;renderEvaluations();}
-    const configSignature = JSON.stringify(pipeline.config || {});
-    if (forceConfig || !$("pipeline-config-form") || !state.pipelineDirty && configSignature !== state.pipelineConfigSignature) renderPipelineConfig();
-    if ($("pipeline-config-save")) $("pipeline-config-save").disabled = Boolean(state.pipelinePending || pipelineActive(phase));
+    updatePipelineExecution();updatePipelineStages();renderPipelineMonitor();updateStageStartDialog();
+    if (state.route.tab === "evaluation") {
+      updateEvaluationLive();
+      const signature = JSON.stringify(pipeline.evaluations || []);
+      if (signature !== state.evaluationSignature) {state.evaluationSignature = signature;renderEvaluations();}
+    } else {
+      const signature = JSON.stringify(pipeline.models || []);
+      if (signature !== state.modelSignature) {state.modelSignature = signature;renderModelRegistry();}
+    }
+  }
+
+  function trainingAlgorithmOptions(stage) {
+    const defaults = stage === "bc" ? [{id:"dp",label:"Diffusion Policy (DP)",available:true},{id:"pi0",label:"π0",available:false},{id:"pi0_5",label:"π0.5",available:false}] : [{id:"residual_td3",label:"Residual TD3",available:true}];
+    const catalog = currentPipeline()?.algorithm_catalog?.[stage] || [];
+    return defaults.map(item => ({...item,...catalog.find(option => option.id === item.id),available:item.available && catalog.find(option => option.id === item.id)?.available !== false}));
+  }
+
+  function selectedTrainingAlgorithm(stage) {
+    const configured = currentPipeline()?.config?.[stage === "bc" ? "bc_algorithm" : "rl_algorithm"];
+    return state.trainingAlgorithms[stage] ?? configured ?? (stage === "bc" ? "dp" : "residual_td3");
+  }
+
+  function trainingAlgorithmAvailable(stage, algorithm) {
+    return algorithm === (stage === "bc" ? "dp" : "residual_td3") && trainingAlgorithmOptions(stage).some(item => item.id === algorithm && item.available);
   }
 
   function updatePipelineExecution() {
-    if (!$("pipeline-execution")) return;
-    const pipeline = currentPipeline(), status = pipeline?.status || {}, config = pipeline?.config || {};
+    if (state.route.tab === "overview") {updatePipelineView();return;}
+    if (!["models","evaluation"].includes(state.route.tab)) return;
+    const pipeline = currentPipeline(), status = pipeline?.status || {};
     if (!pipeline) return;
-    const auto = state.pipelineMode === "auto", busy = pipelineActive(status.phase), paused = status.phase === "paused";
-    const global = pipelineRuntime(), other = global && pipelineActive(global.phase) && global.project_id !== state.route.id;
-    const ready = pipelineReadiness(auto ? "auto" : state.pipelineStage);
-    const unavailable = Boolean(!state.connected || state.pipelinePending || state.pipelinePausePending || busy || other || !ready.ready || state.pipelineDirty);
-    $("pipeline-mode-auto").classList.toggle("selected",auto);$("pipeline-mode-auto").setAttribute("aria-pressed",String(auto));
-    $("pipeline-mode-manual").classList.toggle("selected",!auto);$("pipeline-mode-manual").setAttribute("aria-pressed",String(!auto));
-    const executionSignature = JSON.stringify([status.phase,status.stage,status.mode,status.cycle,status.round,status.error,config.collection_episodes,config.bc_success_target,config.max_bc_cycles,config.max_rl_rounds,state.pipelineMode,state.pipelineStage,ready,global,state.pipelinePending,state.pipelinePausePending,state.connected,state.pipelineDirty]);
+    const busy = pipelineActive(status.phase), global = pipelineRuntime();
+    const other = global && pipelineActive(global.phase) && global.project_id !== state.route.id;
+    const executionSignature = JSON.stringify([status,pipeline.readiness,pipeline.config,pipeline.algorithm_catalog,pipeline.rl_preparation,state.route.tab,state.evaluationStage,state.trainingAlgorithms,global,state.pipelinePending,state.pipelinePausePending,state.connected]);
     if (executionSignature === state.pipelineExecutionSignature) return;
     state.pipelineExecutionSignature = executionSignature;
-    const reason = other ? "다른 프로젝트의 파이프라인이 실행 중입니다." : state.pipelineDirty ? "변경한 학습 설정을 저장한 뒤 실행하세요." : !ready.ready ? ready.reason || "이 단계의 실행 조건을 아직 충족하지 않았습니다." : "";
-    $("pipeline-execution").innerHTML = `<div class="pipeline-run-choice"><div class="pipeline-run-copy"><h3>${auto ? "목표 성공률까지 순서대로 진행" : "선택한 단계만 실행"}</h3><p>${auto ? `GPT 수집 ${count(config.collection_episodes)}회 → DP 학습 → BC 평가를 반복합니다. BC ${finiteValue(config.bc_success_target,1)}%를 통과하면 Progress와 Residual RL로 이어집니다.` : "학습 데이터와 이전 모델을 확인하며 각 단계를 개별 실행할 수 있습니다. 다른 단계로 자동 전환하지 않습니다."}</p>${auto ? `<div class="pipeline-run-limits">${tag(`BC 최대 ${count(config.max_bc_cycles)} cycles`)}${tag(`RL 최대 ${count(config.max_rl_rounds)} rounds`)}</div>` : `<label class="field manual-stage-field">실행할 단계<select id="pipeline-manual-stage" ${busy || state.pipelinePending ? "disabled" : ""}>${pipelineStages.map(stage => `<option value="${stage.id}" ${stage.id === state.pipelineStage ? "selected" : ""}>${stage.number} · ${esc(stage.name)}</option>`).join("")}</select></label>`}</div><button id="pipeline-start" class="button primary" data-action="${auto ? "pipeline-start-auto" : "pipeline-start-manual"}" ${unavailable ? "disabled" : ""}>${icon(auto ? "play" : "step")}${state.pipelinePending === "start" ? "시작 요청 중…" : auto ? "전체 파이프라인 시작" : "선택 단계 실행"}</button></div>${reason ? `<p class="pipeline-readiness" role="status">${icon("info")}${esc(reason)}</p>` : ""}<div class="pipeline-control-strip"><div><span class="pipeline-current-label">${status.stage ? esc(pipelineStageName(status.stage)) : "아직 시작하지 않았습니다"}</span><span>${status.mode ? `${status.mode === "auto" ? "자동" : "단계별"} 실행` : ""}${status.cycle ? ` · Cycle ${count(status.cycle)}` : ""}${status.round ? ` · Round ${count(status.round)}` : ""}</span></div><div class="pipeline-control-buttons"><button class="button pause small" data-action="pipeline-pause" ${status.phase !== "running" || state.pipelinePausePending || !state.connected ? "disabled" : ""}>${icon("pause")}${state.pipelinePausePending ? "요청 중…" : "Pause"}</button><button class="button secondary small" data-action="pipeline-resume" ${!paused || state.pipelinePending || state.pipelinePausePending || !state.connected ? "disabled" : ""}>${icon("play")}재개</button><button class="button danger small" data-action="pipeline-stop" ${!busy || state.pipelinePending || !state.connected ? "disabled" : ""}>${icon("stop")}중지</button></div></div>${status.error ? `<p class="pipeline-error" role="alert">${esc(status.error)}</p>` : ""}`;
+    if (state.route.tab === "models") {
+      for (const stage of ["bc","rl"]) {
+        const target = $(`training-${stage}-execution`);if (!target) continue;
+        const ready = pipelineReadiness(stage), algorithm = selectedTrainingAlgorithm(stage), options = trainingAlgorithmOptions(stage);
+        const supported = trainingAlgorithmAvailable(stage,algorithm);
+        const disabled = !state.connected || state.pipelinePending || state.pipelinePausePending || busy || other || !ready.ready || !supported;
+        const reason = other ? "다른 프로젝트의 파이프라인이 실행 중입니다." : !supported ? "선택한 알고리즘은 아직 구현되지 않았습니다. 지원되는 알고리즘을 선택해주세요." : !ready.ready ? ready.reason || "실행 조건을 확인해주세요." : "";
+        const preparing = stage === "rl" && status.stage === "progress" && busy;
+        target.innerHTML = `<div class="pipeline-run-choice"><div class="pipeline-run-copy"><h3>${stage === "bc" ? "기본 정책 학습" : preparing ? "RL 준비 · Progress 보조 모델 학습 중" : "Residual 정책 학습"}</h3><p>${stage === "bc" ? "알고리즘을 선택한 뒤 학습 설정을 확인하고 실행하세요." : "필요한 Progress 보조 모델은 자동으로 준비합니다. 준비 후 RL 학습을 진행합니다."}</p><label class="field training-algorithm-field">알고리즘<select id="training-${stage}-algorithm" data-training-algorithm="${stage}" ${busy || state.pipelinePending ? "disabled" : ""}>${options.some(item => item.id === algorithm) ? "" : `<option value="${esc(algorithm)}" selected disabled>${esc(algorithm)} · 지원하지 않음</option>`}${options.map(item => `<option value="${esc(item.id)}" ${item.id === algorithm ? "selected" : ""} ${!item.available ? "disabled" : ""}>${esc(item.label)}${item.available ? "" : " · 미구현"}</option>`).join("")}</select></label></div><button id="training-${stage}-start" class="button primary" data-action="pipeline-start-manual" data-stage="${stage}" ${disabled ? "disabled" : ""}>${icon("play")}${stage.toUpperCase()} 학습 실행</button></div>${reason ? `<p class="pipeline-readiness" role="status">${icon("info")}${esc(reason)}</p>` : ""}`;
+      }
+      if ($("training-pipeline-controls")) $("training-pipeline-controls").innerHTML = pipelineControlStrip(status);
+      return;
+    }
+    if (!$("pipeline-execution")) return;
+    const stage = state.evaluationStage, ready = pipelineReadiness(stage);
+    const disabled = !state.connected || state.pipelinePending || state.pipelinePausePending || busy || other || !ready.ready;
+    const reason = other ? "다른 프로젝트의 파이프라인이 실행 중입니다." : !ready.ready ? ready.reason || "이 평가의 실행 조건을 아직 충족하지 않았습니다." : "";
+    $("pipeline-execution").innerHTML = `<div class="pipeline-run-choice"><div class="pipeline-run-copy"><h3>평가할 정책 선택</h3><p>설정 팝업에서 평가 조건을 확인한 뒤 선택한 정책만 실행합니다.</p><label class="field manual-stage-field">평가 대상<select id="pipeline-manual-stage" ${busy || state.pipelinePending ? "disabled" : ""}>${manualPipelineStages().map(item => `<option value="${item.id}" ${item.id === stage ? "selected" : ""}>${esc(item.name)}</option>`).join("")}</select></label></div><button id="pipeline-start" class="button primary" data-action="pipeline-start-manual" data-stage="${stage}" ${disabled ? "disabled" : ""}>${icon("play")}평가 실행</button></div>${reason ? `<p class="pipeline-readiness" role="status">${icon("info")}${esc(reason)}</p>` : ""}${pipelineControlStrip(status)}`;
   }
 
   function updatePipelineStages() {
     const pipeline = currentPipeline();
-    if (!pipeline || !$("pipeline-stages")) return;
-    const status = pipeline.status || {};
-    $("pipeline-stages").innerHTML = pipelineStages.map(stage => {
-      const active = status.stage === stage.id && pipelineActive(status.phase), ready = pipelineReadiness(stage.id);
-      const label = active ? pipelinePhaseNames[status.phase] : ready.ready ? "실행 가능" : "조건 대기";
-      return `<div class="pipeline-stage ${active ? "active" : ""}"><span class="stage-number">${stage.number}</span><div class="stage-description"><h3>${esc(stage.name)}</h3><p>${esc(stage.description)}</p>${!ready.ready && ready.reason ? `<small>${esc(ready.reason)}</small>` : ""}</div>${tag(label,active ? status.phase === "paused" ? "warning" : "success" : "neutral")}</div>`;
+    if (state.route.tab !== "models" || !pipeline || !$("pipeline-stages")) return;
+    const status = pipeline.status || {}, names = {bc:"BC 학습",rl:"RL 학습"};
+    $("pipeline-stages").innerHTML = pipelineStages.filter(stage => ["bc","rl"].includes(stage.id)).map((stage,index) => {
+      const preparing = stage.id === "rl" && status.stage === "progress";
+      const active = (status.stage === stage.id || preparing) && pipelineActive(status.phase), ready = pipelineReadiness(stage.id);
+      const completion = pipeline.completion?.stages?.[stage.id]?.complete;
+      const label = active ? preparing ? "RL 준비" : pipelinePhaseNames[status.phase] : completion ? "완료" : ready.ready ? "실행 가능" : "조건 대기";
+      return `<div class="pipeline-stage ${active ? "active" : ""}"><span class="stage-number">${String(index+1).padStart(2,"0")}</span><div class="stage-description"><h3>${names[stage.id]}</h3></div>${tag(label,active ? status.phase === "paused" ? "warning" : "success" : completion ? "success" : "neutral")}</div>`;
     }).join("");
   }
 
+  function stageMonitorData(stage) {
+    const status = currentPipeline()?.status || {}, jobId = status.job_id;
+    if (!jobId) return {metrics:{},events:[],current:false,jobId:null};
+    const started = n(status.started_at), events = (status.events || []).filter(event => event.job_id === jobId && event.stage === stage && (!started || n(event.time || event.timestamp) >= started));
+    const current = status.stage === stage && status.phase !== "idle";
+    // Historical unscoped metrics and events cannot be assigned to a model safely.
+    const metrics = current ? status.metrics || {} : events.length ? status.stage_metrics?.[stage] || {} : {};
+    return {metrics,events,current,jobId};
+  }
+
+  function renderStageMonitor(stage, targetId) {
+    const target = $(targetId);if (!target) return;
+    const pipeline = currentPipeline(), status = pipeline?.status || {}, data = stageMonitorData(stage), metrics = data.metrics;
+    const modelKind = stage === "bc" ? "bc" : stage === "rl" ? "residual" : null;
+    const recentModel = modelKind ? (pipeline?.models || []).filter(model => model.kind === modelKind && model.status === "ready" && model.metrics?.partial !== true).sort((a,b) => n(b.created_at)-n(a.created_at))[0] : null;
+    const recentMetrics = recentModel?.metrics || {};
+    const matchingModel = recentModel && pipeline.completion?.stages?.[stage]?.complete && pipeline.completion.stages[stage].model_id === recentModel.id;
+    const recentValues = stage === "bc" ? [["학습 steps",recentMetrics.steps_completed ?? recentMetrics.step],["Best validation loss",recentMetrics.best_validation_loss ?? recentMetrics.validation_loss]] : [["Critic updates",recentMetrics.critic_updates],["Actor updates",recentMetrics.actor_updates],["Online steps",recentMetrics.online_steps],["Critic loss",recentMetrics.critic_loss]];
+    const recentHTML = recentModel ? `<section class="recent-training-record"><div><h3>최근 완료 모델</h3>${tag(matchingModel ? "현재 설정과 일치" : "저장된 학습 기록",matchingModel ? "success" : "neutral")}</div><p>${esc(date(recentModel.created_at))} · ${esc(recentModel.id)}</p><dl>${recentValues.map(([name,value]) => `<div><dt>${name}</dt><dd>${finiteValue(value,5)}</dd></div>`).join("")}</dl><small>저장된 모델의 완료 기록입니다. 위 지표는 현재 작업의 해당 단계만 표시합니다.</small>${stage === "bc" ? `<button type="button" class="button secondary small" data-action="bc-history" data-metric="train_loss" data-model="${esc(recentModel.id)}">${icon("progress")}이 모델의 학습 기록</button>` : ""}</section>` : "";
+    const isBC = stage === "bc", isRL = stage === "rl", title = isBC ? "BC 학습 지표·로그" : isRL ? "RL 학습 지표·로그" : `${stage === "bc_eval" ? "BC" : "RL"} 평가 실행 지표·로그`;
+    const value = key => finiteValue(metrics[key],5), phase = data.current ? pipelinePhaseNames[status.phase] || status.phase : Object.keys(metrics).length ? "현재 작업의 기록" : "기록 대기";
+    const cards = isBC ? [["학습 step",finiteValue(metrics.step,0),"BC optimizer updates"],["Train loss",value("train_loss"),"BC 학습 loss"],["Validation loss",value("validation_loss"),"BC 검증 loss"]] : isRL ? [["Critic loss",value("critic_loss"),"Residual TD3 critic"],["Actor loss",value("actor_loss"),"Warmup·지연 update 중에는 값이 없을 수 있습니다"],["Online steps",finiteValue(metrics.online_steps,0),"누적 online transition 수"],["Critic updates",finiteValue(metrics.critic_updates,0),"누적 critic update 수"]] : [["Episode return",value("episode_return"),"해당 평가 rollout reward 합계"],["Environment steps",finiteValue(metrics.environment_steps,0),"해당 평가에서 보고한 값"]];
+    const prep = isRL ? stageMonitorData("progress") : null;
+    const preparing = isRL && status.stage === "progress" && pipelineActive(status.phase);
+    const prepHTML = prep && (preparing || prep.events.length) ? `<section class="rl-preparation-monitor"><div><h3>RL 준비 · Progress 보조 모델</h3>${tag(preparing ? pipelinePhaseNames[status.phase] || "준비 중" : "현재 작업의 준비 기록",preparing ? "warning" : "neutral")}</div><dl><div><dt>학습 step</dt><dd>${finiteValue(prep.metrics.step,0)}</dd></div><div><dt>Progress loss</dt><dd>${finiteValue(prep.metrics.progress_loss,5)}</dd></div><div><dt>Validation MAE</dt><dd>${finiteValue(prep.metrics.progress_validation_mae,5)}</dd></div></dl>${prep.events.length ? `<ol class="learning-event-list">${prep.events.slice(-5).reverse().map(event => `<li><time>${esc(date(event.time || event.timestamp))}</time><span>${esc(event.message || event.kind || "준비 상태 갱신")}</span></li>`).join("")}</ol>` : ""}</section>` : "";
+    const scalarMetrics = Object.entries(metrics).filter(([,value]) => ["number","string","boolean"].includes(typeof value));
+    const expanded = target.querySelector(".learning-metric-details")?.open;
+    target.innerHTML = `<section class="panel learning-monitor-panel stage-monitor-panel"><div class="panel-header"><div><h2>${title}</h2><p>${data.jobId ? `작업 ${esc(data.jobId)}` : "실제 실행 이후 지표가 표시됩니다"}</p></div>${tag(phase,data.current && status.phase === "running" ? "success" : "neutral")}</div>${prepHTML}<section class="metrics learning-metrics stage-learning-metrics" aria-label="${title}">${cards.map(([label,value,foot],index) => isBC ? `<button type="button" class="metric bc-metric-button" data-action="bc-history" data-metric="${["step","train_loss","validation_loss"][index]}" aria-haspopup="dialog" aria-label="${esc(label)} 학습 기록 열기"><span class="metric-label">${esc(label)}${icon("progress")}</span><span class="metric-value">${value}</span><span class="metric-foot">${esc(foot)} · 기록 보기 ${icon("arrow")}</span></button>` : metric(label,value,foot,"progress")).join("")}</section>${data.events.length ? `<ol class="learning-event-list">${data.events.slice(-10).reverse().map(event => `<li><time>${esc(date(event.time || event.timestamp))}</time><span>${esc(event.message || event.kind || "실행 상태 갱신")}</span></li>`).join("")}</ol>` : '<p class="learning-empty">현재 작업에서 이 단계의 기록이 없습니다.</p>'}${recentHTML}${scalarMetrics.length ? `<details class="learning-metric-details" ${expanded ? "open" : ""}><summary>이 단계의 전체 지표</summary><dl>${scalarMetrics.map(([key,value]) => `<div><dt>${esc(key)}</dt><dd>${typeof value === "number" ? finiteValue(value,6) : esc(value)}</dd></div>`).join("")}</dl></details>` : ""}</section>`;
+  }
+
   function renderPipelineMonitor() {
-    const pipeline = currentPipeline();
-    if (!pipeline || !$("pipeline-monitor")) return;
-    const status = pipeline.status || {}, metrics = status.metrics || {}, events = status.events || [];
-    const value = (...keys) => {for (const key of keys) if (typeof metrics[key] === "number") return metrics[key];return undefined;};
-    const progress = value("step","critic_updates","update_step","updates","global_step","environment_steps");
-    const loss = value("critic_loss","val_loss","validation_loss","progress_validation_mae","progress_loss","train_loss","loss");
-    const lossLabel = typeof metrics.critic_loss === "number" ? "Critic loss" : typeof metrics.progress_validation_mae === "number" ? "Progress validation MAE" : typeof metrics.val_loss === "number" || typeof metrics.validation_loss === "number" ? "Validation loss" : "학습 loss";
-    const live = status.phase && status.phase !== "idle";
-    const metricData = Object.entries(metrics).filter(([key,val]) => ["number","string","boolean"].includes(typeof val));
-    const expandedMetrics = $("pipeline-monitor").querySelector(".learning-metric-details")?.open;
-    $("pipeline-monitor").innerHTML = `<section class="metrics learning-metrics" aria-label="파이프라인 실행 지표">${metric("현재 단계",`<span class="metric-text">${live ? esc(pipelineStageName(status.stage)) : "실행 대기"}</span>`,`${status.cycle ? `Cycle ${status.cycle} · ` : ""}${progress !== undefined ? `${count(progress)} updates / steps` : "실제 실행 이후 지표가 표시됩니다"}`,"flow")}${metric(lossLabel,finiteValue(loss,5),"현재 단계에서 보고한 값","progress")}${metric("Episode return",finiteValue(value("episode_return","mean_return","return"),3),"Task rollout reward 합계","layers")}${metric("Residual magnitude",finiteValue(value("residual_magnitude","residual_norm","residual_l2"),5),"실행 action에 적용한 보정량","model")}</section><section class="panel learning-monitor-panel"><div class="panel-header"><h2>파이프라인 실행 기록</h2><span class="tag neutral">${count(events.length)} events</span></div>${events.length ? `<ol class="learning-event-list">${events.slice(-10).reverse().map(event => `<li><time>${esc(date(event.time || event.timestamp))}</time><span>${esc(event.message || event.kind || "실행 상태 갱신")}</span></li>`).join("")}</ol>` : '<p class="learning-empty">아직 실행한 단계가 없습니다. 모델이나 평가 결과를 생성하지 않은 상태입니다.</p>'}${metricData.length ? `<details class="learning-metric-details" ${expandedMetrics ? "open" : ""}><summary>현재 단계의 전체 지표</summary><dl>${metricData.map(([key,val]) => `<div><dt>${esc(key)}</dt><dd>${typeof val === "number" ? finiteValue(val,6) : esc(val)}</dd></div>`).join("")}</dl></details>` : ""}</section>`;
+    if (state.route.tab === "models") {renderStageMonitor("bc","training-bc-monitor");renderStageMonitor("rl","training-rl-monitor");return;}
+    if (state.route.tab === "evaluation") {
+      const actual = currentPipeline()?.status?.stage;
+      renderStageMonitor(["bc_eval","rl_eval"].includes(actual) ? actual : state.evaluationStage,"pipeline-monitor");
+    }
+  }
+
+  function bcHistoryIsCurrent(history = state.bcHistory) {
+    return Boolean(history && state.bcHistory === history && $("bc-history-dialog")?.open && history.projectId === state.route.id && history.routeToken === state.routeToken && state.route.tab === "models");
+  }
+
+  function closeBCHistory() {
+    const history = state.bcHistory;
+    if (history) {clearTimeout(history.timer);history.controller?.abort();}
+    state.bcHistory = null;
+  }
+
+  function openBCHistory(metric = "train_loss", modelId = null) {
+    if (state.route.tab !== "models" || !state.route.id) return;
+    closeBCHistory();
+    state.bcHistory = {projectId:state.route.id,routeToken:state.routeToken,modelId:modelId || currentPipeline()?.bc_training?.model_id || null,jobId:null,metric:["step","train_loss","validation_loss"].includes(metric) ? metric : "train_loss",data:null,points:[],selectedIndex:0,followLatest:true,busy:false,timer:null,controller:null};
+    $("bc-history-title").textContent = "BC 학습 기록";$("bc-history-error").hidden = true;
+    $("bc-history-identity").textContent = "학습 기록을 불러오고 있습니다.";
+    $("bc-history-content").innerHTML = '<p class="learning-empty">기록된 학습 지표와 체크포인트를 확인하고 있습니다.</p>';
+    if (!$("bc-history-dialog").open) $("bc-history-dialog").showModal();
+    refreshBCHistory();
+  }
+
+  async function refreshBCHistory() {
+    const history = state.bcHistory;
+    if (!bcHistoryIsCurrent(history) || history.busy) return;
+    clearTimeout(history.timer);history.busy = true;history.controller = new AbortController();
+    try {
+      const suffix = history.modelId ? `?model_id=${encodeURIComponent(history.modelId)}` : "";
+      const result = await api(`/api/projects/${encodeURIComponent(history.projectId)}/learning/bc/history${suffix}`,undefined,15000,history.controller.signal);
+      if (!bcHistoryIsCurrent(history)) return;
+      if (result.project_id && result.project_id !== history.projectId || history.modelId && result.model_id !== history.modelId || history.jobId && result.job_id && result.job_id !== history.jobId) throw new Error("다른 학습의 응답이 도착해 현재 그래프를 유지했습니다. 팝업을 다시 열어 확인해주세요.");
+      if (result.model_id) history.modelId = result.model_id;
+      if (result.job_id) history.jobId = result.job_id;
+      history.data = result;$("bc-history-error").hidden = true;renderBCHistory();
+    } catch (error) {
+      if (bcHistoryIsCurrent(history)) {
+        $("bc-history-error").textContent = error.message;$("bc-history-error").hidden = false;
+        if (!history.data) $("bc-history-content").innerHTML = '<p class="learning-empty">기록을 불러오지 못했습니다. 연결이 돌아오면 자동으로 다시 확인합니다.</p>';
+      }
+    } finally {
+      history.busy = false;history.controller = null;
+      if (bcHistoryIsCurrent(history)) history.timer = setTimeout(refreshBCHistory,2500);
+    }
+  }
+
+  function bcHistoryPoints(data) {
+    return (Array.isArray(data?.points) ? data.points : []).filter(point => Number.isFinite(point.step) && point.step >= 0).map(point => ({step:point.step,time:Number.isFinite(point.time) ? point.time : null,train_loss:Number.isFinite(point.train_loss) ? point.train_loss : null,validation_loss:Number.isFinite(point.validation_loss) ? point.validation_loss : null})).sort((a,b) => a.step-b.step || (a.time ?? 0)-(b.time ?? 0));
+  }
+
+  function latestBCHistoryIndex(points, metric) {
+    for (let index=points.length-1;index>=0;index--) if (metric === "step" || Number.isFinite(points[index][metric])) return index;
+    return Math.max(0,points.length-1);
+  }
+
+  function bcHistoryChart(history) {
+    const points = history.points, timeView = history.metric === "step";
+    const finitePoints = timeView ? points.filter(point => point.time !== null) : points.filter(point => point.train_loss !== null || point.validation_loss !== null);
+    history.chart = null;
+    if (!finitePoints.length) return `<p class="bc-history-empty">${timeView ? "시간이 기록된 학습 step이 없습니다." : "아직 기록된 loss가 없습니다."} 기록되지 않은 값은 추정해 표시하지 않습니다.</p>`;
+    const width = 760, height = 320, left = 65, right = 22, top = 22, bottom = 47, plotWidth = width-left-right, plotHeight = height-top-bottom;
+    const firstTime = finitePoints.reduce((earliest,point) => Math.min(earliest,point.time ?? Infinity),Infinity);
+    const xValue = point => timeView ? point.time-firstTime : point.step;
+    const xMax = finitePoints.reduce((maximum,point) => Math.max(maximum,xValue(point)),1);
+    const yValues = timeView ? finitePoints.map(point => point.step) : finitePoints.flatMap(point => [point.train_loss,point.validation_loss].filter(value => value !== null));
+    let yMin = timeView ? 0 : yValues.reduce((minimum,value) => Math.min(minimum,value),Infinity), yMax = yValues.reduce((maximum,value) => Math.max(maximum,value),-Infinity);
+    const padding = Math.max((yMax-yMin)*.08,Math.abs(yMax)*.03,.000001);
+    if (!timeView) yMin -= padding;
+    yMax += padding;if (yMax === yMin) yMax = yMin+1;
+    const x = value => left+value/xMax*plotWidth, y = value => top+(yMax-value)/(yMax-yMin)*plotHeight;
+    history.chart = {width,height,left,top,plotWidth,plotHeight,xMax,yMin,yMax,firstTime,timeView};
+    const grid = Array.from({length:5},(_,index) => {
+      const fraction = index/4, yy = top+plotHeight*(1-fraction), xx = left+plotWidth*fraction;
+      return `<line x1="${left}" x2="${width-right}" y1="${yy}" y2="${yy}" class="bc-chart-grid"/><text x="${left-10}" y="${yy+4}" text-anchor="end">${esc(finiteValue(yMin+(yMax-yMin)*fraction,timeView ? 0 : 4))}</text><text x="${xx}" y="${height-24}" text-anchor="middle">${esc(finiteValue(xMax*fraction/(timeView && xMax>=120 ? 60 : 1),timeView ? 1 : 0))}</text>`;
+    }).join("");
+    const series = timeView ? [{key:"step",color:"step",line:true}] : [{key:"train_loss",color:"train",line:true},{key:"validation_loss",color:"validation",line:false}];
+    const lines = series.map(item => {
+      const values = finitePoints.filter(point => Number.isFinite(point[item.key]));
+      const path = item.line && values.length>1 ? `<path class="bc-chart-line ${item.color}" d="${values.map((point,index) => `${index ? "L" : "M"}${x(xValue(point)).toFixed(2)},${y(point[item.key]).toFixed(2)}`).join(" ")}"/>` : "";
+      const dots = !item.line || values.length<=100 ? values.map(point => `<circle class="bc-chart-dot ${item.color}" cx="${x(xValue(point)).toFixed(2)}" cy="${y(point[item.key]).toFixed(2)}" r="${item.line ? 2.7 : 3.5}"><title>Step ${esc(point.step)} · ${item.key}: ${esc(finiteValue(point[item.key],6))}</title></circle>`).join("") : "";
+      return `<g class="bc-chart-series ${history.metric === item.key ? "selected" : ""}">${path}${dots}</g>`;
+    }).join("");
+    const observedStep = finitePoints.reduce((maximum,point) => Math.max(maximum,point.step),0);
+    const markers = (Array.isArray(history.data.checkpoints) ? history.data.checkpoints : []).filter(checkpoint => Number.isFinite(checkpoint.step) && checkpoint.step>=0 && checkpoint.step<=observedStep).map(checkpoint => timeView ? `<line x1="${left}" x2="${width-right}" y1="${y(checkpoint.step)}" y2="${y(checkpoint.step)}" class="bc-chart-checkpoint"><title>${esc(checkpoint.file || "Checkpoint")} · Step ${esc(checkpoint.step)}</title></line>` : `<line x1="${x(checkpoint.step)}" x2="${x(checkpoint.step)}" y1="${top}" y2="${height-bottom}" class="bc-chart-checkpoint"><title>${esc(checkpoint.file || "Checkpoint")} · Step ${esc(checkpoint.step)}</title></line>`).join("");
+    return `<div class="bc-chart-legend">${timeView ? '<span class="step">학습 step</span>' : '<span class="train">Train loss</span><span class="validation">Validation loss · 실제 관측점</span>'}</div><div class="bc-chart-wrap"><svg id="bc-history-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${timeView ? "경과 시간별 학습 step" : "학습 step별 train loss와 실제 validation loss 관측점"}">${grid}${markers}${lines}<line id="bc-history-cursor" class="bc-chart-cursor" x1="${left}" x2="${left}" y1="${top}" y2="${height-bottom}" visibility="hidden"/><circle id="bc-history-highlight" class="bc-chart-highlight" cx="${left}" cy="${top}" r="5" visibility="hidden"/><text x="${left+plotWidth/2}" y="${height-4}" text-anchor="middle">${timeView ? xMax>=120 ? "첫 표시 기록 이후 (분)" : "첫 표시 기록 이후 (초)" : "학습 step"}</text></svg></div><p class="bc-chart-caption">${finitePoints.length===1 ? "관측점이 1개라 추세선은 표시하지 않습니다. " : ""}${timeView ? "첫 표시 기록을 시간 원점으로 삼아 실제 시각과 학습 step을 표시합니다." : "Train loss는 기록된 점을 연결하며 Validation loss는 실제 관측점만 표시합니다."} 회색 점선은 실제 체크포인트의 저장 step입니다.</p>`;
+  }
+
+  function renderBCHistory() {
+    const history = state.bcHistory;if (!bcHistoryIsCurrent(history) || !history.data) return;
+    const data = history.data, previous = history.points[history.selectedIndex], focused = document.activeElement?.id;
+    history.points = bcHistoryPoints(data);const points = history.points;
+    let selected = history.followLatest ? latestBCHistoryIndex(points,history.metric) : points.findIndex(point => point.step === previous?.step && point.time === previous?.time);
+    if (selected<0) selected = latestBCHistoryIndex(points,history.metric);
+    history.selectedIndex = selected;
+    const latest = points.at(-1), lastTrain = points[latestBCHistoryIndex(points,"train_loss")], lastValidation = points[latestBCHistoryIndex(points,"validation_loss")];
+    const target = Number.isFinite(data.target_steps) && data.target_steps>0 ? data.target_steps : null;
+    const progress = latest && target ? Math.min(100,latest.step/target*100) : null;
+    const phase = pipelinePhaseNames[data.phase] || data.phase || "상태 기록 없음";
+    $("bc-history-identity").textContent = history.modelId ? `${history.modelId}${history.jobId ? ` · 작업 ${history.jobId}` : ""} · ${phase}` : "아직 BC 학습 기록이 없습니다.";
+    const summary = `<div class="bc-history-summary"><div><span>학습 step / 목표</span><strong>${latest ? count(latest.step) : "—"} / ${target ? count(target) : "—"}</strong><small>${progress === null ? "기록된 step 기준" : `${finiteValue(progress,1)}% · 기록된 step 기준`}</small></div><div><span>최근 Train loss</span><strong>${finiteValue(lastTrain?.train_loss,5)}</strong><small>${Number.isFinite(lastTrain?.train_loss) ? `Step ${count(lastTrain.step)}` : "관측 기록 없음"}</small></div><div><span>최근 Validation loss</span><strong>${finiteValue(lastValidation?.validation_loss,5)}</strong><small>${Number.isFinite(lastValidation?.validation_loss) ? `Step ${count(lastValidation.step)}` : "관측 기록 없음"}</small></div></div>`;
+    const tabs = `<div class="bc-history-views" role="group" aria-label="학습 그래프 선택">${[["step","학습 step"],["train_loss","Train loss"],["validation_loss","Validation loss"]].map(([key,label]) => `<button id="bc-history-view-${key}" type="button" data-action="bc-history-view" data-metric="${key}" aria-pressed="${history.metric === key}" class="${history.metric === key ? "active" : ""}">${label}</button>`).join("")}</div>`;
+    const reasons = {no_training:"아직 BC 학습을 실행한 기록이 없습니다.",metrics_not_found:"이 학습의 지표 로그 파일을 찾을 수 없습니다. 저장된 최종 모델 지표만으로 과거 그래프를 만들지는 않습니다.",no_metrics:"학습은 기록되었지만 아직 지표가 저장되지 않았습니다."};
+    const chart = points.length ? `${bcHistoryChart(history)}<div class="bc-history-point-controls"><label for="bc-history-point-range">기록 선택<input id="bc-history-point-range" type="range" min="0" max="${Math.max(0,points.length-1)}" step="1" value="${selected}" ${points.length<2 ? "disabled" : ""}></label><button type="button" class="button secondary small" data-action="bc-history-latest">최신 지점</button></div><div id="bc-history-point" class="bc-history-point" aria-live="polite"></div>` : `<p class="bc-history-empty">${esc(reasons[data.reason] || data.reason || "아직 기록된 학습 지표가 없습니다.")}</p>`;
+    const checkpoints = Array.isArray(data.checkpoints) ? data.checkpoints : [], kinds = {periodic:"주기 저장",final:"학습 종료 저장",best:"검증 최상 정책"};
+    const checkpointHTML = `<section class="bc-history-checkpoints"><h3>실제 저장된 체크포인트 <span class="tag neutral">${count(checkpoints.length)}</span></h3>${checkpoints.length ? `<div class="table-wrap"><table><thead><tr><th>Step</th><th>종류</th><th>파일</th><th>저장 시각</th></tr></thead><tbody>${checkpoints.map(checkpoint => `<tr><td>${Number.isFinite(checkpoint.step) ? count(checkpoint.step) : "—"}</td><td>${esc(kinds[checkpoint.kind] || checkpoint.kind || "기록 참고")}</td><td><code>${esc(checkpoint.file || "—")}</code></td><td>${checkpoint.created_at ? esc(date(checkpoint.created_at)) : "—"}</td></tr>`).join("")}</tbody></table></div>` : '<p class="field-note">이 학습에 저장된 체크포인트 기록이 없습니다.</p>'}<p class="field-note">주기·종료 체크포인트의 학습 상태와 검증 최상 policy는 구분됩니다. 저장된 파일만 표시하며 별도의 완료 모델로 계산하지 않습니다.</p></section>`;
+    $("bc-history-content").innerHTML = `${summary}${tabs}${chart}<p class="bc-history-footnote">${data.sampled ? `읽은 ${count(data.total_points)}개 중 ${count(points.length)}개 관측점을 표시합니다. ` : `${count(points.length)}개 관측점. `}${data.truncated ? "로그 크기 제한으로 일부 이전 기록은 포함되지 않았습니다. " : ""}팝업이 열린 동안 이 학습 기록만 자동 갱신합니다.</p>${checkpointHTML}`;
+    updateBCHistoryPoint(selected,history.followLatest);
+    if (focused?.startsWith("bc-history-")) $(focused)?.focus({preventScroll:true});
+  }
+
+  function updateBCHistoryPoint(index, followLatest = false) {
+    const history = state.bcHistory;if (!bcHistoryIsCurrent(history) || !history.points.length) return;
+    history.selectedIndex = Math.max(0,Math.min(history.points.length-1,index));history.followLatest = followLatest;
+    const point = history.points[history.selectedIndex], chart = history.chart;
+    if ($("bc-history-point-range")) $("bc-history-point-range").value = String(history.selectedIndex);
+    if ($("bc-history-point")) $("bc-history-point").innerHTML = `<strong>Step ${count(point.step)}</strong><span>Train loss ${finiteValue(point.train_loss,6)}</span><span>Validation loss ${finiteValue(point.validation_loss,6)}</span><time>${point.time === null ? "시각 기록 없음" : esc(date(point.time))}</time>`;
+    if (!chart || !$("bc-history-cursor")) return;
+    const xValue = chart.timeView ? point.time === null ? null : point.time-chart.firstTime : point.step;
+    const value = chart.timeView ? point.step : point[history.metric];
+    $("bc-history-cursor").setAttribute("visibility",xValue === null ? "hidden" : "visible");$("bc-history-highlight").setAttribute("visibility",xValue === null || !Number.isFinite(value) ? "hidden" : "visible");
+    if (xValue !== null) {
+      const x = chart.left+xValue/chart.xMax*chart.plotWidth;
+      $("bc-history-cursor").setAttribute("x1",x);$("bc-history-cursor").setAttribute("x2",x);
+      $("bc-history-highlight").setAttribute("cx",x);
+      if (Number.isFinite(value)) $("bc-history-highlight").setAttribute("cy",chart.top+(chart.yMax-value)/(chart.yMax-chart.yMin)*chart.plotHeight);
+    }
+  }
+
+  function inspectBCHistoryPointer(event) {
+    const svg = event.target.closest?.("#bc-history-chart"), history = state.bcHistory;
+    if (!svg || !bcHistoryIsCurrent(history) || !history.chart) return;
+    const chart = history.chart, rect = svg.getBoundingClientRect();if (!rect.width) return;
+    const x = (event.clientX-rect.left)/rect.width*chart.width;
+    const requested = Math.max(0,Math.min(chart.xMax,(x-chart.left)/chart.plotWidth*chart.xMax));
+    let index = -1, distance = Infinity;
+    history.points.forEach((point,i) => {
+      if (chart.timeView ? point.time === null : !Number.isFinite(point[history.metric])) return;
+      const actual = chart.timeView ? point.time-chart.firstTime : point.step;
+      if (Math.abs(actual-requested)<distance) {index = i;distance = Math.abs(actual-requested);}
+    });
+    if (index>=0) updateBCHistoryPoint(index);
   }
 
   function renderModelRegistry() {
@@ -325,12 +1037,12 @@
       $("pipeline-models").innerHTML = `<div class="learning-empty-models">${icon("model")}<h3>아직 학습된 모델이 없습니다</h3><p>DP, Progress, Residual checkpoint가 생성되면 학습 설정·데이터와 함께 여기에 표시됩니다.</p></div>`;
       return;
     }
-    const labels = {bc:"Diffusion Policy",progress:"Task Progress",residual:"Residual TD3"};
+    const labels = {bc:"Diffusion Policy",progress:"RL 보조 · Task Progress",residual:"Residual TD3"};
     $("pipeline-models").innerHTML = `<div class="learned-model-list">${models.slice().sort((a,b) => n(b.created_at)-n(a.created_at)).map(model => {
       const download = asset(model.checkpoint_url), metrics = model.metrics || {}, dataset = model.dataset || {};
       const episodes = dataset.episodes ?? dataset.episode_count ?? dataset.episode_ids?.length;
       const validationLoss = metrics.best_validation_loss ?? metrics.validation_loss ?? metrics.val_loss;
-      return `<article class="learned-model"><div class="learned-model-header"><div class="learned-model-icon">${icon(model.kind === "progress" ? "progress" : "model")}</div><div><h3>${esc(model.name || labels[model.kind] || model.kind || "Model")}</h3><p>${esc(model.id || "")} · ${esc(date(model.created_at))}</p></div>${tag(model.status === "ready" ? "사용 가능" : model.status || "저장됨",model.status === "ready" ? "success" : "neutral")}</div><dl class="learned-model-facts"><div><dt>종류</dt><dd>${esc(labels[model.kind] || model.kind || "—")}</dd></div><div><dt>학습 episodes</dt><dd>${episodes === undefined ? "기록 참고" : count(Array.isArray(episodes) ? episodes.length : episodes)}</dd></div>${model.base_model_id ? `<div><dt>Frozen base</dt><dd>${esc(model.base_model_id)}</dd></div>` : ""}${typeof validationLoss === "number" ? `<div><dt>Validation loss</dt><dd>${finiteValue(validationLoss,5)}</dd></div>` : ""}</dl><details class="learned-model-details"><summary>설정·학습 데이터·지표</summary><div class="model-detail-columns">${[["설정",model.config],["학습 데이터",model.dataset],["지표",model.metrics]].filter(([,value]) => value).map(([name,value]) => `<div><h4>${name}</h4><pre>${esc(JSON.stringify(value,null,2))}</pre></div>`).join("")}</div>${model.checkpoint || model.path ? `<p class="model-checkpoint-path">${esc(model.checkpoint || model.path)}</p>` : ""}</details>${download ? `<a class="button secondary small" href="${esc(download)}" download>${icon("download")}Checkpoint 다운로드</a>` : ""}</article>`;
+      return `<article class="learned-model"><div class="learned-model-header"><div class="learned-model-icon">${icon(model.kind === "progress" ? "progress" : "model")}</div><div><h3>${esc(model.name || labels[model.kind] || model.kind || "Model")}</h3><p>${esc(model.id || "")} · ${esc(date(model.created_at))}</p></div>${tag(model.status === "ready" ? "사용 가능" : model.status || "저장됨",model.status === "ready" ? "success" : "neutral")}</div><dl class="learned-model-facts"><div><dt>종류</dt><dd>${esc(model.kind === "progress" ? labels.progress : model.algorithm_label || labels[model.kind] || model.kind || "—")}</dd></div><div><dt>학습 episodes</dt><dd>${episodes === undefined ? "기록 참고" : count(Array.isArray(episodes) ? episodes.length : episodes)}</dd></div>${model.base_model_id ? `<div><dt>Frozen base</dt><dd>${esc(model.base_model_id)}</dd></div>` : ""}${typeof validationLoss === "number" ? `<div><dt>Validation loss</dt><dd>${finiteValue(validationLoss,5)}</dd></div>` : ""}</dl><details class="learned-model-details"><summary>설정·학습 데이터·지표</summary><div class="model-detail-columns">${[["설정",model.config],["학습 데이터",model.dataset],["지표",model.metrics]].filter(([,value]) => value).map(([name,value]) => `<div><h4>${name}</h4><pre>${esc(JSON.stringify(value,null,2))}</pre></div>`).join("")}</div>${model.checkpoint || model.path ? `<p class="model-checkpoint-path">${esc(model.checkpoint || model.path)}</p>` : ""}</details>${download ? `<a class="button secondary small" href="${esc(download)}" download>${icon("download")}Checkpoint 다운로드</a>` : ""}</article>`;
     }).join("")}</div>`;
   }
 
@@ -339,24 +1051,213 @@
     const label = value => ["residual","rl","rl_eval"].includes(value) ? "BC + Residual" : "BC only";
     const latestBC = evaluations.find(item => ["bc","bc_eval","bc_only"].includes(item.kind || item.policy));
     const latestRL = evaluations.find(item => ["residual","rl","rl_eval"].includes(item.kind || item.policy));
-    const card = (title,item) => `<div class="evaluation-comparison-card"><span>${title}</span><strong>${item && typeof item.success_rate === "number" ? `${finiteValue(item.success_rate,1)}<small>%</small>` : "—"}</strong><p>${item ? `${count(item.successes)} / ${count(item.episodes)} episodes 성공` : "아직 완료된 평가가 없습니다"}</p>${item ? `<span class="evaluation-return">평균 return ${finiteValue(item.mean_return,3)}</span>` : ""}</div>`;
-    $("pipeline-evaluations").innerHTML = `<div class="evaluation-comparison">${card("BC only · 최근 평가",latestBC)}${card("BC + Residual · 최근 평가",latestRL)}</div>${evaluations.length ? `<div class="table-wrap"><table class="evaluation-table"><thead><tr><th>정책</th><th>평가 시각</th><th>성공률</th><th>Episodes</th><th>평균 return</th><th>모델</th></tr></thead><tbody>${evaluations.map(item => `<tr><td><strong>${label(item.kind || item.policy)}</strong></td><td>${esc(date(item.created_at))}</td><td>${finiteValue(item.success_rate,1)}%</td><td>${count(item.successes)} / ${count(item.episodes)}</td><td>${finiteValue(item.mean_return,3)}</td><td><span class="evaluation-model-id">${esc(item.residual_model_id || item.model_id || item.checkpoint_id || "—")}</span></td></tr>`).join("")}</tbody></table></div>` : ""}<p class="evaluation-footnote">학습 중 loss와 실제 rollout 성공률은 별도로 기록됩니다. 평가의 성공·실패 episode는 데이터 탭에서 확인할 수 있습니다.</p>`;
+    const card = (title,item) => `<div class="evaluation-comparison-card"><span>${title}</span><strong>${item && typeof item.success_rate === "number" ? `${finiteValue(item.success_rate,1)}<small>%</small>` : "—"}</strong><p>${item ? `${count(item.successes)} / ${count(item.episodes)} episodes 성공` : "아직 완료된 평가가 없습니다"}</p>${item ? `<span class="evaluation-return">평균 return ${finiteValue(item.mean_return,3)}</span><span class="evaluation-reset-protocol">${esc(evaluationResetProtocol(item))}</span>` : ""}</div>`;
+    $("pipeline-evaluations").innerHTML = `<div class="evaluation-comparison">${card("BC only · 최근 평가",latestBC)}${card("BC + Residual · 최근 평가",latestRL)}</div>${evaluations.length ? `<div class="table-wrap"><table class="evaluation-table"><thead><tr><th>정책</th><th>평가 시각</th><th>성공률</th><th>Episodes</th><th>평균 return</th><th>Reset 방식</th><th>모델</th></tr></thead><tbody>${evaluations.map(item => `<tr><td><strong>${label(item.kind || item.policy)}</strong></td><td>${esc(date(item.created_at))}</td><td>${finiteValue(item.success_rate,1)}%</td><td>${count(item.successes)} / ${count(item.episodes)}</td><td>${finiteValue(item.mean_return,3)}</td><td class="evaluation-protocol-cell">${esc(evaluationResetProtocol(item))}${item.evaluation_protocol ? `<span class="table-sub">${esc(item.evaluation_protocol)}</span>` : ""}</td><td><span class="evaluation-model-id">${esc(item.residual_model_id || item.model_id || item.checkpoint_id || "—")}</span></td></tr>`).join("")}</tbody></table></div>` : ""}<p class="evaluation-footnote">학습 중 loss와 실제 rollout 성공률은 별도로 기록됩니다. 평가마다 기록된 reset 방식이 표시되며, 성공·실패 episode는 데이터 탭에서 확인할 수 있습니다.</p>`;
   }
 
-  function renderPipelineConfig() {
-    const pipeline = currentPipeline();
-    if (!pipeline || !$("pipeline-config")) return;
-    const config = pipeline.config || {}, deps = pipeline.dependencies || {};
-    state.pipelineConfigSignature = JSON.stringify(config);state.pipelineDirty = false;
-    $("pipeline-config-state").textContent = "저장된 설정";$("pipeline-config-state").className = "tag neutral";
+  function pipelineStartBlockedReason() {
+    const pipeline = currentPipeline(), runtime = pipelineRuntime();
+    if (!state.connected) return "서버 연결을 확인해주세요.";
+    if (!pipeline?.config || pipeline.unavailable) return "파이프라인 설정을 불러온 뒤 다시 시도해주세요.";
+    if (pipelineActive(pipeline.status?.phase)) return "진행 중인 파이프라인을 완료하거나 중지한 뒤 설정할 수 있습니다.";
+    if (runtime && pipelineActive(runtime.phase)) return "진행 중인 파이프라인을 완료하거나 중지한 뒤 실행할 수 있습니다.";
+    return "";
+  }
+
+  function openPipelineStartDialog() {
+    const projectId = state.route.id, pipeline = currentPipeline(), dialog = $("pipeline-start-dialog");
+    if (!projectId || state.route.tab !== "overview" || state.pipelinePending || state.pipelinePausePending || dialog.open) return;
+    const reason = pipelineStartBlockedReason();
+    if (reason) {toast(reason,true);return;}
+    const config = pipeline.config;
+    state.pipelineDialog = {projectId,routeToken:state.routeToken,baseCollectionGoal:config.collection_episodes,bcSteps:config.bc?.steps,busy:false};
     const field = (name,label,min,max,unit="",step=1) => numericField(name,label,config[name],min,max,unit,step);
-    $("pipeline-config").innerHTML = `<form id="pipeline-config-form" class="pipeline-config-form"><div class="pipeline-config-group"><h3>수집과 평가</h3><div class="form-grid three">${field("collection_episodes","Cycle당 GPT 수집",1,100,"episodes")}${field("evaluation_episodes","평가 episode 수",1,100,"episodes")}${field("run_budget_usd","Rollout run당 API 예산",.01,1000,"$",.01)}${field("bc_success_target","BC 성공률 목표",1,100,"%",1)}${field("rl_success_target","RL 성공률 목표",1,100,"%",1)}<label class="field">학습 장치<select name="device"><option value="auto">Auto · 사용 가능한 장치</option><option value="cuda">CUDA GPU</option><option value="cpu">CPU</option>${config.device && !["auto","cuda","cpu"].includes(config.device) ? `<option value="${esc(config.device)}">${esc(config.device)}</option>` : ""}</select></label></div><p class="field-note">${deps.torch === false ? "PyTorch가 설치되지 않아 학습을 실행할 수 없습니다." : deps.cuda ? "CUDA GPU를 사용할 수 있습니다." : "현재 CUDA GPU가 확인되지 않았습니다. Auto는 CPU를 사용합니다."} API 예산은 응답 수신 후 확인하므로 마지막 호출 비용만큼 초과할 수 있습니다.</p></div><div class="pipeline-config-group"><h3>반복 한도와 진행도 판단</h3><div class="form-grid three">${field("max_bc_cycles","BC 최대 cycle",1,1000,"회")}${field("max_rl_rounds","RL 최대 round",1,1000,"회")}${field("rl_episodes_per_round","RL round당 episode",1,100,"개")}${field("progress_gate_threshold","GPT 판단 시작 progress",0,1,"",.01)}${field("gpt_judge_interval","후반 GPT 판단 간격",1,10000,"steps")}</div><p class="field-note">Task 진행도가 설정값에 도달하면 지정한 간격으로 GPT 판단을 요청합니다. Reset은 GPT가 수행하며, 복구하지 못하면 중지합니다.</p></div><details class="advanced-learning-config"><summary>${icon("settings")}모델별 hyperparameter</summary><p class="field-note">각 모델의 전체 설정을 JSON으로 편집합니다. 저장은 학습을 시작하지 않습니다.</p>${[["bc","Diffusion Policy","영상 encoder, observation/action horizon, diffusion·학습 설정"],["progress","Progress 모델","성공 데이터의 진행도 학습과 encoder 설정"],["residual","Residual TD3","보정 범위, replay 혼합, n-step, UTD, critic·target 설정"]].map(([key,label,help]) => `<label class="field advanced-config-field">${label}<small>${help}</small><textarea id="config-${key}" name="config_${key}" rows="12" spellcheck="false" aria-label="${label} hyperparameter JSON">${esc(JSON.stringify(config[key] || {},null,2))}</textarea></label>`).join("")}</details><p id="pipeline-config-error" class="form-error" role="alert" hidden></p><div class="pipeline-config-actions"><p>진행 중인 파이프라인의 설정은 고정됩니다. 중지하거나 완료한 뒤 다음 실행 설정을 저장하세요.</p><div><button class="button secondary" type="button" data-action="pipeline-config-discard">편집 취소</button><button id="pipeline-config-save" class="button primary" type="submit">${icon("check")}학습 설정 저장</button></div></div></form>`;
-    $("pipeline-config-form").elements.device.value = config.device || "auto";
+    $("pipeline-start-fields").innerHTML = `<div class="form-grid three">${field("collection_episodes","BC 시작 성공 episode 목표",1,100,"개")}${numericField("bc_steps","BC 학습 step 수",config.bc?.steps ?? 10000,1,1000000,"steps")}${field("evaluation_episodes","평가 episode 수",1,100,"개")}${field("bc_success_target","BC 성공률 목표",.1,100,"%",.1)}${field("rl_success_target","RL 성공률 목표",.1,100,"%",.1)}${field("rl_episodes_per_round","RL round당 episode",1,100,"개")}${evaluationResetField(config.evaluation_reset_mode || "inherit")}</div><p class="field-note">성공 episode 목표는 기본 수집 목표입니다. BC 평가 미달로 늘어난 현재 누적 목표는 아래에 표시됩니다. 기본 목표를 바꾸면 새 값으로 다시 설정됩니다.</p><details class="pipeline-start-options"><summary>반복 한도와 실행 환경</summary><div class="form-grid three">${field("max_bc_cycles","BC 최대 cycle",1,1000,"회")}${field("max_rl_rounds","RL 최대 round",1,1000,"회")}${field("run_budget_usd","Run당 API 비용 한도",.01,1000,"$",.01)}<label class="field">학습 장치<select name="device"><option value="auto">Auto</option><option value="cuda">CUDA GPU</option><option value="cuda:0">CUDA:0</option><option value="cpu">CPU</option>${config.device && !["auto","cuda","cuda:0","cpu"].includes(config.device) ? `<option value="${esc(config.device)}">${esc(config.device)}</option>` : ""}</select></label></div></details>`;
+    $("pipeline-start-form").elements.device.value = config.device || "auto";
+    $("pipeline-start-error").hidden = true;$("pipeline-start-error").textContent = "";
+    dialog.showModal();updatePipelineStartPreview();
+  }
+
+  function updatePipelineStartPreview() {
+    const pending = state.pipelineDialog, dialog = $("pipeline-start-dialog");
+    if (!pending || !dialog?.open || pending.projectId !== state.route.id || pending.routeToken !== state.routeToken) return;
+    const pipeline = currentPipeline(), collection = pipeline?.completion?.collect || {};
+    const input = Number($("pipeline-start-form").elements.collection_episodes?.value);
+    const target = input === pending.baseCollectionGoal ? collection.target ?? pending.baseCollectionGoal : input;
+    const completed = collection.completed ?? currentProject()?.stats?.successes ?? 0;
+    const valid = Number.isFinite(target) && target > 0;
+    $("pipeline-start-summary").innerHTML = `<strong>사용 중 성공 episode ${count(completed)}개</strong><span>${valid ? `현재 누적 목표 ${count(target)}개 · 추가 성공 episode ${count(Math.max(0,target-completed))}개 필요` : "유효한 성공 episode 목표를 입력해주세요."}</span><small>보관·삭제 데이터는 제외합니다. 저장 후 현재 모델·평가 결과를 확인해 필요한 단계부터 실행합니다.</small>`;
+    const reason = pipelineStartBlockedReason();
+    $("pipeline-start-fields").disabled = Boolean(pending.busy || reason);
+    $("pipeline-start-confirm").disabled = Boolean(pending.busy || reason);
+    $("pipeline-start-confirm").textContent = pending.busy ? "설정 저장·실행 중…" : "설정 저장 후 실행";
+    $("pipeline-start-runtime-note").textContent = reason;
+    $("pipeline-start-runtime-note").hidden = !reason;
+  }
+
+  async function submitPipelineStart(event) {
+    event.preventDefault();
+    const pending = state.pipelineDialog, form = event.target;
+    const current = () => state.pipelineDialog === pending && $("pipeline-start-dialog").open && pending?.projectId === state.route.id && pending.routeToken === state.routeToken;
+    if (!pending || !current() || pending.busy || state.pipelinePending || !form.reportValidity()) return;
+    const reason = pipelineStartBlockedReason();
+    if (reason) {$("pipeline-start-error").textContent = reason;$("pipeline-start-error").hidden = false;return;}
+    const data = new FormData(form), patch = {};
+    for (const key of ["collection_episodes","evaluation_episodes","bc_success_target","rl_success_target","rl_episodes_per_round","max_bc_cycles","max_rl_rounds","run_budget_usd"]) patch[key] = Number(data.get(key));
+    patch.device = String(data.get("device"));
+    patch.evaluation_reset_mode = String(data.get("evaluation_reset_mode") || "inherit");
+    const bcSteps = Number(data.get("bc_steps"));
+    if (bcSteps !== pending.bcSteps) patch.bc = {...currentPipeline().config.bc,steps:bcSteps};
+    pending.busy = true;state.pipelinePending = "configure-start";$("pipeline-start-error").hidden = true;updatePipelineStartPreview();updatePipelineView();
+    let saved = false;
+    try {
+      const projectId = pending.projectId;
+      const result = await api(`/api/projects/${encodeURIComponent(projectId)}/pipeline/config`,patch);
+      saved = true;
+      if (!current()) return;
+      state.pipelineRequest += 1;state.pipelineBusy = false;state.pipeline = result;state.pipelineProjectId = projectId;
+      if (result.auto_plan?.complete) {
+        $("pipeline-start-dialog").close();toast("설정을 저장했습니다. 모든 목표를 달성해 추가 실행은 시작하지 않았습니다.");return;
+      }
+      if (!result.auto_plan || !result.readiness?.auto?.ready) throw new Error(result.readiness?.auto?.reason || "저장된 설정의 실행 가능 여부를 확인할 수 없습니다.");
+      if (!current()) return;
+      const started = await api(`/api/projects/${encodeURIComponent(projectId)}/pipeline/start`,{mode:"auto"},30000);
+      if (!current()) return;
+      if (started.config) {state.pipelineRequest += 1;state.pipelineBusy = false;state.pipeline = started;state.pipelineProjectId = projectId;}
+      $("pipeline-start-dialog").close();toast("설정을 저장하고 남은 파이프라인 실행을 시작했습니다.");
+    } catch (error) {
+      if (current()) {
+        $("pipeline-start-error").textContent = `${saved ? "설정은 저장되었습니다. 실행 상태를 확인해주세요. " : ""}${error.message}`;
+        $("pipeline-start-error").hidden = false;
+        if (saved) await refreshPipeline(true);
+      }
+    } finally {
+      pending.busy = false;
+      if (state.pipelinePending === "configure-start") state.pipelinePending = null;
+      if (pending.projectId === state.route.id && pending.routeToken === state.routeToken) {updatePipelineView();updatePipelineStartPreview();renderGlobal();}
+    }
+  }
+
+
+
+  function stageStartBlockedReason(stage, algorithm) {
+    const reason = pipelineStartBlockedReason();if (reason) return reason;
+    if (!manualPipelineStages().some(item => item.id === stage)) return "현재 화면에서 실행할 수 없는 단계입니다.";
+    if (["bc","rl"].includes(stage) && !trainingAlgorithmAvailable(stage,algorithm)) return "선택한 알고리즘은 아직 구현되지 않았습니다. 지원되는 알고리즘을 선택해주세요.";
+    const readiness = pipelineReadiness(stage);
+    return readiness.ready ? "" : readiness.reason || "이 단계의 실행 조건을 아직 충족하지 않았습니다.";
+  }
+
+  function learningDeviceField(device = "auto") {
+    const options = [["auto","Auto · 사용 가능한 장치"],["cuda","CUDA GPU"],["cuda:0","CUDA:0"],["cpu","CPU"]];
+    if (!options.some(([value]) => value === device)) options.push([device,device]);
+    return `<label class="field">실행 장치<select name="device">${options.map(([value,label]) => `<option value="${esc(value)}" ${value === device ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label>`;
+  }
+
+  function stageHyperparameterField(key, label, config, help = "") {
+    return `<label class="field advanced-config-field">${esc(label)}<small>${esc(help)}</small><textarea name="config_${key}" rows="12" spellcheck="false" aria-label="${esc(label)} hyperparameter JSON">${esc(JSON.stringify(config || {},null,2))}</textarea></label>`;
+  }
+
+  function openStageStartDialog(stage) {
+    const projectId = state.route.id, pipeline = currentPipeline(), dialog = $("stage-start-dialog");
+    if (!projectId || !["models","evaluation"].includes(state.route.tab) || state.pipelinePending || state.pipelinePausePending || dialog.open) return;
+    const algorithm = ["bc","rl"].includes(stage) ? selectedTrainingAlgorithm(stage) : null;
+    const reason = stageStartBlockedReason(stage,algorithm);
+    if (reason) {toast(reason,true);return;}
+    const config = pipeline.config, evaluation = ["bc_eval","rl_eval"].includes(stage), isBC = stage === "bc";
+    const title = evaluation ? `${stage === "bc_eval" ? "BC" : "RL"} 평가 실행 설정` : `${isBC ? "BC" : "RL"} 학습 실행 설정`;
+    state.stageDialog = {projectId,routeToken:state.routeToken,tab:state.route.tab,stage,algorithm,busy:false};
+    const field = (name,label,min,max,unit="",step=1) => numericField(name,label,config[name],min,max,unit,step);
+    let fields;
+    if (evaluation) {
+      fields = `<div class="form-grid three">${field("evaluation_episodes","평가 episode 수",1,100,"개")}${field("bc_success_target","BC 성공률 목표",.1,100,"%",.1)}${field("rl_success_target","RL 성공률 목표",.1,100,"%",.1)}${evaluationResetField(config.evaluation_reset_mode || "inherit")}${field("run_budget_usd","Run당 API 비용 한도",.01,1000,"$",.01)}${learningDeviceField(config.device || "auto")}</div><p class="field-note">개별 평가와 전체 파이프라인이 같은 평가 설정을 사용합니다. 수집 설정 따르기는 실행 시 수집 탭의 reset 방식을 사용합니다. 환경 reset은 reset GPT 호출을 생략하며, RL 평가의 진행도 판단은 별도입니다.</p>`;
+    } else {
+      const algorithmLabel = trainingAlgorithmOptions(stage).find(item => item.id === algorithm)?.label || algorithm;
+      const algorithmField = `<label class="field">알고리즘<select name="algorithm"><option value="${esc(algorithm)}" selected>${esc(algorithmLabel)}</option></select></label>`;
+      if (isBC) {
+        const advanced = {...config.bc};delete advanced.steps;delete advanced.checkpoint_every;
+        fields = `<div class="form-grid three">${algorithmField}${numericField("bc_steps","BC 학습 step 수",config.bc?.steps ?? 10000,1,1000000,"steps")}${learningDeviceField(config.device || "auto")}${numericField("checkpoint_every","체크포인트 저장 간격",config.bc?.checkpoint_every ?? 1000,1,1000000,"steps")}</div><p class="field-note">지정한 학습 step 간격으로 학습 상태를 저장합니다. 검증 성능이 가장 좋은 policy 체크포인트는 별도로 유지합니다.</p><details class="advanced-learning-config stage-advanced-config"><summary>${icon("settings")}BC hyperparameter</summary>${stageHyperparameterField("bc","Diffusion Policy",advanced,"학습 steps와 체크포인트 저장 간격은 위 숫자 필드에서 설정합니다. 나머지 전체 설정을 JSON으로 편집하세요.")}</details>`;
+      } else {
+        fields = `<div class="form-grid three">${algorithmField}${field("rl_episodes_per_round","RL 학습 episode 수",1,100,"개")}${learningDeviceField(config.device || "auto")}${field("run_budget_usd","Run당 API 비용 한도",.01,1000,"$",.01)}${field("progress_gate_threshold","GPT 판단 시작 progress",0,1,"",.01)}${field("gpt_judge_interval","후반 GPT 판단 간격",1,10000,"steps")}</div><label class="required-progress-option"><input id="stage-progress-required" type="checkbox" checked disabled aria-describedby="stage-progress-required-note"><span>Progress 모델 사용</span></label><p id="stage-progress-required-note" class="field-note">현재 RL 학습에 필수이며 해제할 수 없습니다. 현재 설정에 맞는 모델을 재사용하고, 필요한 경우 학습한 뒤 RL을 시작합니다.</p><details class="advanced-learning-config stage-advanced-config"><summary>${icon("settings")}RL·Progress hyperparameter</summary>${stageHyperparameterField("residual","Residual TD3",config.residual,"보정 범위, replay 혼합, n-step, UTD, critic·target 설정")}${stageHyperparameterField("progress","Progress 보조 모델",config.progress,"성공 데이터의 진행도 학습과 encoder 설정")}</details>`;
+      }
+    }
+    $("stage-start-title").textContent = title;$("stage-start-eyebrow").textContent = evaluation ? "POLICY EVALUATION" : isBC ? "BC TRAINING" : "RL TRAINING";
+    $("stage-start-description").textContent = "확인 버튼을 누르면 이 단계의 설정을 저장한 뒤 실행합니다. 확인 전에는 저장하거나 실행하지 않습니다.";
+    $("stage-start-fields").innerHTML = fields;
+    $("stage-start-error").textContent = "";$("stage-start-error").hidden = true;
+    dialog.showModal();updateStageStartDialog();
+  }
+
+  function updateStageStartDialog() {
+    const pending = state.stageDialog, dialog = $("stage-start-dialog");
+    if (!pending || !dialog?.open || pending.projectId !== state.route.id || pending.routeToken !== state.routeToken) return;
+    const reason = stageStartBlockedReason(pending.stage,pending.algorithm);
+    $("stage-start-fields").disabled = Boolean(pending.busy || reason);
+    $("stage-start-confirm").disabled = Boolean(pending.busy || reason);
+    $("stage-start-confirm").textContent = pending.busy ? "설정 저장·실행 중…" : "설정 저장 후 실행";
+    $("stage-start-runtime-note").textContent = reason;$("stage-start-runtime-note").hidden = !reason;
+  }
+
+  async function submitStageStart(event) {
+    event.preventDefault();
+    const pending = state.stageDialog, form = event.target;
+    const current = () => state.stageDialog === pending && $("stage-start-dialog").open && pending?.projectId === state.route.id && pending.routeToken === state.routeToken && pending.tab === state.route.tab;
+    if (!pending || !current() || pending.busy || state.pipelinePending || !form.reportValidity()) return;
+    const showError = message => {$("stage-start-error").textContent = message;$("stage-start-error").hidden = false;};
+    const reason = stageStartBlockedReason(pending.stage,pending.algorithm);
+    if (reason) {showError(reason);return;}
+    const data = new FormData(form), patch = {}, stage = pending.stage;
+    const parseConfig = key => {
+      let value;try {value = JSON.parse(data.get(`config_${key}`));} catch {throw new Error(`${key.toUpperCase()} hyperparameter의 JSON 형식을 확인해주세요.`);}
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${key.toUpperCase()} 설정은 JSON object여야 합니다.`);
+      return value;
+    };
+    try {
+      patch.device = String(data.get("device"));
+      if (["bc","rl"].includes(stage)) {
+        const algorithm = String(data.get("algorithm"));
+        if (algorithm !== pending.algorithm || !trainingAlgorithmAvailable(stage,algorithm)) throw new Error("선택한 알고리즘은 아직 구현되지 않았습니다. 지원되는 알고리즘을 선택해주세요.");
+        patch[stage === "bc" ? "bc_algorithm" : "rl_algorithm"] = algorithm;
+        if (stage === "bc") patch.bc = {...parseConfig("bc"),steps:Number(data.get("bc_steps")),checkpoint_every:Number(data.get("checkpoint_every"))};
+        else {
+          for (const key of ["rl_episodes_per_round","run_budget_usd","progress_gate_threshold","gpt_judge_interval"]) patch[key] = Number(data.get(key));
+          patch.residual = parseConfig("residual");patch.progress = parseConfig("progress");
+        }
+      } else {
+        for (const key of ["evaluation_episodes","bc_success_target","rl_success_target","run_budget_usd"]) patch[key] = Number(data.get(key));
+        patch.evaluation_reset_mode = String(data.get("evaluation_reset_mode") || "inherit");
+      }
+    } catch (error) {showError(error.message);return;}
+    pending.busy = true;state.pipelinePending = "stage-configure-start";$("stage-start-error").hidden = true;updateStageStartDialog();updatePipelineView();
+    let saved = false;
+    try {
+      const result = await api(`/api/projects/${encodeURIComponent(pending.projectId)}/pipeline/config`,patch);
+      saved = true;if (!current()) return;
+      state.pipelineRequest += 1;state.pipelineBusy = false;state.pipeline = result;state.pipelineProjectId = pending.projectId;
+      const ready = result.readiness?.[stage];
+      if (!(typeof ready === "boolean" ? ready : ready?.ready)) throw new Error(ready?.reason || "저장된 설정의 실행 가능 여부를 확인할 수 없습니다.");
+      const blocked = stageStartBlockedReason(stage,pending.algorithm);
+      if (blocked) throw new Error(blocked);
+      if (!current()) return;
+      const started = await api(`/api/projects/${encodeURIComponent(pending.projectId)}/pipeline/start`,{mode:"manual",stage},30000);
+      if (!current()) return;
+      if (started.config) {state.pipelineRequest += 1;state.pipelineBusy = false;state.pipeline = started;state.pipelineProjectId = pending.projectId;}
+      $("stage-start-dialog").close();toast(`${["bc_eval","rl_eval"].includes(stage) ? "평가" : stage.toUpperCase()+" 학습"} 설정을 저장하고 실행을 시작했습니다.`);
+      await Promise.allSettled([refreshPipeline(true),refreshStatus(true)]);
+    } catch (error) {
+      if (current()) {
+        showError(`${saved ? "설정은 저장되었습니다. 실행 상태를 확인해주세요. " : ""}${error.message}`);
+        if (saved) await refreshPipeline(true);
+      }
+    } finally {
+      pending.busy = false;if (state.pipelinePending === "stage-configure-start") state.pipelinePending = null;
+      if (pending.projectId === state.route.id && pending.routeToken === state.routeToken) {updatePipelineView();updateStageStartDialog();renderGlobal();}
+    }
   }
 
   async function refreshPipeline(force = false) {
     const id = state.route.id, token = state.routeToken;
-    if (!id || state.pipelineBusy && !force || !force && !["overview","models"].includes(state.route.tab)) return;
+    if (!id || state.pipelineBusy && !force || !force && !["overview","models","evaluation","collection"].includes(state.route.tab)) return;
     if (!force && !pipelineEnabled()) return;
     const requestId = ++state.pipelineRequest;
     state.pipelineBusy = true;
@@ -364,7 +1265,7 @@
       const data = await api(`/api/projects/${encodeURIComponent(id)}/pipeline`);
       if (requestId !== state.pipelineRequest || token !== state.routeToken || id !== state.route.id) return;
       state.pipeline = data;state.pipelineProjectId = id;
-      updatePipelineView();renderGlobal();updateCollection();
+      updatePipelineView();updatePipelineStartPreview();updateStageStartDialog();renderGlobal();updateCollection();
     } catch (error) {
       if (requestId !== state.pipelineRequest || token !== state.routeToken) return;
       if (!pipelineEnabled()) {state.pipeline = {unavailable:true};state.pipelineProjectId = id;updatePipelineView();}
@@ -374,6 +1275,8 @@
 
   async function pipelineCommand(action, payload = {}, projectId = state.route.id) {
     if (!projectId || (action === "pause" ? state.pipelinePausePending : state.pipelinePending)) return;
+    if (action === "start" && (payload.mode === "auto" ? state.route.tab !== "overview" : !["models","evaluation"].includes(state.route.tab) || !manualPipelineStages().some(stage => stage.id === payload.stage))) return;
+    if (action === "start" && payload.mode === "auto" && currentPipeline()?.auto_plan?.complete) {toast("모든 목표를 달성했습니다. 추가 실행이 필요하지 않습니다.");return;}
     if (action === "pause") state.pipelinePausePending = true;else state.pipelinePending = action;
     updatePipelineExecution();renderGlobal();
     try {
@@ -386,47 +1289,16 @@
     finally {if (action === "pause") state.pipelinePausePending = false;else state.pipelinePending = null;updatePipelineView();renderGlobal();}
   }
 
-  async function savePipelineConfig(event) {
-    event.preventDefault();
-    const pipeline = currentPipeline(), projectId = state.route.id, token = state.routeToken;
-    const form = event.target;
-    if (!pipeline || !form.reportValidity() || state.pipelinePending) return;
-    const data = new FormData(form), config = structuredClone(pipeline.config || {});
-    try {
-      for (const key of ["collection_episodes","evaluation_episodes","run_budget_usd","bc_success_target","rl_success_target","max_bc_cycles","max_rl_rounds","rl_episodes_per_round","progress_gate_threshold","gpt_judge_interval"]) config[key] = Number(data.get(key));
-      config.device = data.get("device");
-      for (const key of ["bc","progress","residual"]) {
-        try {config[key] = JSON.parse(data.get(`config_${key}`));}
-        catch {throw new Error(`${key.toUpperCase()} hyperparameter의 JSON 형식을 확인해주세요.`);}
-        if (!config[key] || typeof config[key] !== "object" || Array.isArray(config[key])) throw new Error(`${key.toUpperCase()} 설정은 JSON object여야 합니다.`);
-      }
-      state.pipelinePending = "config";$("pipeline-config-save").disabled = true;$("pipeline-config-error").hidden = true;
-      const result = await api(`/api/projects/${encodeURIComponent(projectId)}/pipeline/config`,config);
-      if (token !== state.routeToken || state.route.id !== projectId) return;
-      state.pipelineDirty = false;
-      if (result.config) {state.pipeline = result;state.pipelineProjectId = projectId;}
-      await refreshPipeline(true);
-      if (token === state.routeToken) updatePipelineView(true);
-      toast("학습 설정을 저장했습니다. 실행은 아직 시작하지 않았습니다.");
-    } catch (error) {
-      if (token === state.routeToken && $("pipeline-config-error")) {$("pipeline-config-error").textContent = error.message;$("pipeline-config-error").hidden = false;}
-      else toast(error.message,true);
-    } finally {state.pipelinePending = null;if (token === state.routeToken) updatePipelineView();}
-  }
 
-  const numericField = (name, label, value, min, max, unit = "", step = 1) => `<label class="field">${esc(label)}<div class="input-unit"><input name="${name}" type="number" min="${min}" max="${max}" step="${step}" required value="${n(value)}">${unit ? `<span>${esc(unit)}</span>` : ""}</div></label>`;
+
+  const numericField = (name, label, value, min, max, unit = "", step = 1) => `<label class="field">${esc(label)}<div class="input-unit${unit === "$" ? " currency-prefix" : ""}">${unit === "$" ? "<span>$</span>" : ""}<input name="${name}" type="number" min="${min}" max="${max}" step="${step}" required value="${n(value)}">${unit && unit !== "$" ? `<span>${esc(unit)}</span>` : ""}</div></label>`;
 
   function renderSettings(project) {
-    const config = project.run_config || {}, pipe = project.pipeline || {}, selected = nextPolicy(project);
+    const selected = nextPolicy(project);
     const models = policyOptions().models || [];
     const known = models.some(item => item.model === selected.model);
     const modelChoices = `${known ? "" : `<option value="${esc(selected.model || "")}">${esc(selected.model || "서버 기본값")} · 서버 설정</option>`}${models.map(item => `<option value="${esc(item.model)}">${esc(item.label || item.model)}</option>`).join("")}`;
-    $("tab-content").innerHTML = `<form id="settings-form" class="settings-layout"><section class="panel settings-section"><div class="panel-header"><div><h2>프로젝트 정보</h2><p>Task별 데이터와 실행을 구분하는 이름과 설명</p></div></div><div class="panel-body"><div class="form-grid"><label class="field full">프로젝트 이름<input name="name" required maxlength="120" value="${esc(project.name)}"></label><label class="field full">설명<textarea name="description" rows="2" maxlength="2000">${esc(project.description || "")}</textarea></label><label class="field">환경<input readonly value="${esc(project.backend?.toUpperCase())} · ${esc(project.suite)}"></label><label class="field">Task<input readonly value="${n(project.task_id)} · ${esc(project.task_name || "")}"></label></div></div></section><section class="panel settings-section"><div class="panel-header"><div><h2>GPT 모델 설정</h2><p>이 프로젝트의 데이터 수집과 reset에 사용할 모델</p></div>${tag("프로젝트별 설정","success")}</div><div class="panel-body"><div class="form-grid"><label class="field">추론 모델<select id="policy-model" name="policy_model" required>${modelChoices}</select></label><label class="field">추론 수준<select id="policy-effort" name="reasoning_effort" required></select></label></div><div id="policy-run-status" class="policy-run-status"></div><p class="field-note">저장 후 다음 <strong>환경 준비</strong> 또는 <strong>복구된 환경에서 이어 수집</strong>부터 적용됩니다. 이미 준비했거나 일시정지한 실행은 기존 모델·추론 수준을 유지합니다.</p><p id="policy-model-note" class="field-note"></p></div></section><section class="panel settings-section"><div class="panel-header"><div><h2>데이터 수집</h2><p>다음 실행에 적용될 episode 수와 실행 한도</p></div>${tag("사용 가능","success")}</div><div class="panel-body"><div class="form-grid three">${numericField("episodes","Episode 수",config.episodes || 1,1,100,"개")}${numericField("budget_usd","API 비용 한도",config.budget_usd || 15,.01,1000,"$",.01)}${numericField("seed","초기 seed",config.seed || 0,0,2147473648)}${numericField("max_steps","Task 최대 step",config.max_steps || 300,1,10000)}${numericField("max_decisions","Task 최대 GPT 호출",config.max_decisions || 50,1,1000)}<label class="field">Reset 방식<select name="reset_mode"><option value="agent">GPT arm reset</option><option value="environment">환경 초기화</option></select></label>${numericField("max_reset_steps","Reset 최대 step",config.max_reset_steps || 300,1,10000)}${numericField("max_reset_decisions","Reset 최대 GPT 호출",config.max_reset_decisions || 40,1,1000)}</div><p class="field-note">GPT arm reset은 같은 물리 상태에서 복구를 수행합니다. 비용 한도는 응답 후 확인하므로 마지막 요청 비용만큼 초과할 수 있습니다.</p></div></section><section class="panel settings-section"><div class="panel-header"><div><h2>학습 파이프라인 목표</h2><p>Orchestration에서 확인할 단계별 전환 조건</p></div>${tag("계획 · 미구현")}</div><div class="panel-body"><div class="form-grid three">${numericField("demo_target","BC 시작 성공 demo 수",pipe.demo_target || 20,1,100000,"개")}${numericField("bc_success_target","BC 성공률 목표",pipe.bc_success_target || 70,1,100,"%")}${numericField("rl_success_target","RL 성공률 목표",pipe.rl_success_target || 90,1,100,"%")}</div><p class="field-note">목표는 저장되지만 학습과 평가는 아직 실행되지 않습니다. 현재 수집된 demo 수만 실제 기록에서 집계합니다.</p></div></section><p id="settings-error" class="form-error" role="alert" hidden></p><div class="settings-actions"><p>저장해도 실행 중인 수집 설정은 바뀌지 않습니다.</p><button id="settings-save" class="button primary" type="submit">${icon("check")}설정 저장</button></div></form>`;
-    $("settings-form").elements.reset_mode.value = config.reset_mode || "agent";
-    if (pipelineEnabled()) {
-      const section = [...document.querySelectorAll("#settings-form .settings-section")].find(node => node.querySelector("h2")?.textContent === "학습 파이프라인 목표");
-      if (section) section.innerHTML = `<div class="panel-header"><div><h2>학습 파이프라인 설정</h2><p>수집 수·성공률 목표와 모델별 hyperparameter</p></div>${tag("모델 탭에서 관리","success")}</div><div class="panel-body learning-settings-link"><p>DP, Progress, Residual TD3의 학습 설정과 자동·단계별 실행은 모델 탭에서 관리합니다. 학습 중에는 데이터 수집을 멈춥니다.</p><a class="button secondary" href="${routeUrl(project.id,"models")}">${icon("model")}모델 · 파이프라인 설정</a></div>`;
-    }
+    $("tab-content").innerHTML = `<form id="settings-form" class="settings-layout"><section class="panel settings-section"><div class="panel-header"><div><h2>프로젝트 정보</h2><p>Task별 데이터와 실행을 구분하는 이름과 설명</p></div></div><div class="panel-body"><div class="form-grid"><label class="field full">프로젝트 이름<input name="name" required maxlength="120" value="${esc(project.name)}"></label><label class="field full">설명<textarea name="description" rows="2" maxlength="2000">${esc(project.description || "")}</textarea></label></div></div></section><section class="panel settings-section"><div class="panel-header"><div><h2>GPT 모델 설정</h2><p>이 프로젝트의 데이터 수집과 reset에 사용할 모델</p></div>${tag("프로젝트별 설정","success")}</div><div class="panel-body"><div class="form-grid"><label class="field">추론 모델<select id="policy-model" name="policy_model" required>${modelChoices}</select></label><label class="field">추론 수준<select id="policy-effort" name="reasoning_effort" required></select></label></div><div id="policy-run-status" class="policy-run-status"></div><p class="field-note">저장 후 다음 <strong>새 run 시작</strong>부터 적용됩니다. 환경을 다시 연결할 필요는 없습니다. 시작한 run은 Pause·재개 시에도 기존 모델·추론 수준을 유지합니다.</p><p id="policy-model-note" class="field-note"></p></div></section>${graspBaselinePanel(project)}<p id="settings-error" class="form-error" role="alert" hidden></p><div class="settings-actions"><p>환경 재연결 없이 다음 새 run에 적용됩니다. 진행 중인 run은 기존 설정을 유지합니다.</p><button id="settings-save" class="button primary" type="submit">${icon("check")}설정 저장</button></div></form>`;
     $("policy-model").value = selected.model || "";
     updatePolicyEfforts(selected.reasoning_effort);
     updatePolicyStatus();
@@ -437,7 +1309,7 @@
     if (!select || !model) return;
     const entry = (policyOptions().models || []).find(item => item.model === model.value);
     const values = entry?.reasoning_efforts || [nextPolicy(currentProject()).reasoning_effort].filter(Boolean);
-    select.innerHTML = values.map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join("");
+    select.innerHTML = values.map(value => `<option value="${esc(value)}">${esc(effortLabel(value))}</option>`).join("");
     select.value = values.includes(preferred) ? preferred : entry?.default_reasoning_effort || values[0] || "";
     $("policy-model-note").textContent = entry ? "이미지 입력과 action 생성을 지원하는 모델입니다. 실제 사용 가능 여부는 서버 API key의 접근 권한에 따라 달라집니다." : "현재 서버 기본 모델입니다. 모델을 변경하려면 목록의 지원 모델을 선택하세요.";
   }
@@ -448,42 +1320,49 @@
     const s = runtime(), active = s.active_project_id === project.id && s.run_id;
     const selected = {model:$("policy-model")?.value,reasoning_effort:$("policy-effort")?.value};
     const pending = active && (s.model !== selected.model || s.reasoning_effort !== selected.reasoning_effort);
-    holder.innerHTML = `<div><span>선택한 설정</span><strong>${esc(policyLabel(selected))}</strong></div>${active ? `<div><span>준비된 실행의 설정</span><strong>${esc(policyLabel(s))}</strong>${pending ? tag("다음 실행에 적용","warning") : tag("동일한 설정")}</div>` : `<p>실행을 준비하면 선택한 설정을 실행 기록에 함께 저장합니다.</p>`}`;
+    holder.innerHTML = `<div><span>선택한 설정</span><strong>${esc(policyLabel(selected))}</strong></div>${active ? `<div><span>현재 또는 마지막 run 설정</span><strong>${esc(policyLabel(s))}</strong>${pending ? tag("다음 실행에 적용","warning") : tag("동일한 설정")}</div>` : `<p>새 run을 시작하면 선택한 설정을 실행 기록에 함께 저장합니다.</p>`}`;
+    if (selected.reasoning_effort === "auto") holder.insertAdjacentHTML("beforeend",'<p>Auto는 medium으로 시작합니다. GPT가 정밀 조작·접촉 불확실성·실패 복구를 판단하면 동작 없이 xhigh로 다시 판단하고, 안정화되면 다음 요청부터 medium으로 돌아갑니다. 재판단도 GPT 호출 수와 비용에 포함됩니다.</p>');
   }
 
   function renderCollection(project) {
     state.lastObservation = null;state.lastCameras = "";state.lastEvents = "";
-    $("tab-content").innerHTML = `<div class="collection-layout"><div><section class="panel"><div class="panel-header"><div><h2>실시간 수집</h2><p id="live-subtitle">실행 환경을 준비한 뒤 관측을 확인하세요.</p></div><span id="live-state" class="tag neutral">준비 전</span></div><div id="live-images"><div class="live-placeholder">${icon("camera")}<h3>수집 환경을 준비하세요</h3><p>환경 준비 후 현재 카메라를 확인할 수 있습니다.<br>수집 시작을 누르기 전까지 GPT는 호출되지 않습니다.</p></div></div><div id="observation-footer" class="observation-footer"><span>카메라 대기 중</span><span>현재 프로젝트의 관측만 표시합니다.</span></div><div class="execution-meta"><div><span>현재 단계</span><strong id="live-stage">—</strong></div><div><span>Task / Reset step</span><strong id="live-steps">0 / 0</strong></div><div><span>실행 API 비용</span><strong id="live-cost">—</strong></div></div><div class="collection-record-link">${icon("database")}<span>GPT 판단 요약과 action 기록은 <a href="${routeUrl(project.id,"data")}">데이터 → Episode 상세</a>에서 확인하세요.</span></div></section><section class="panel events-panel"><div class="panel-header"><h2>실행 이벤트</h2><span id="events-count" class="tag neutral">0</span></div><ol id="events-list" class="events-list"><li class="empty-event">이 프로젝트의 실행 이벤트가 여기에 표시됩니다.</li></ol></section></div><aside class="panel control-panel"><div class="panel-header"><h2>수집 제어</h2><a class="icon-button" href="${routeUrl(project.id,"settings")}" aria-label="수집 설정">${icon("settings")}</a></div><div class="panel-body"><section class="control-section"><span class="control-label">01 · 환경 준비</span><button id="initialize-project" class="button secondary full" data-action="initialize" disabled>${icon("robot")}환경 준비</button><p id="initialize-note" class="control-note">새 실행을 위한 환경을 초기화합니다. GPT는 아직 호출하지 않습니다.</p></section><section class="control-section"><span class="control-label">02 · 데이터 수집</span><button id="start-collection" class="button primary full" data-action="start" disabled>${icon("play")}수집 시작</button><div class="control-row"><button id="pause-collection" class="button pause" data-action="pause" disabled>${icon("pause")}Pause</button><button id="step-collection" class="button secondary" data-action="step" disabled>${icon("step")}한 번 실행</button></div><button id="stop-collection" class="button danger full" data-action="stop" style="margin-top:9px" disabled>${icon("stop")}수집 중지</button><p id="control-note" class="control-note">환경을 먼저 준비해주세요.</p></section><section class="control-section"><dl class="session-rows"><div><dt>실행 목표</dt><dd id="live-goal">${n(project.run_config?.episodes) || 1} episodes / run</dd></div><div><dt>Reset</dt><dd id="live-reset-mode">${project.run_config?.reset_mode === "environment" ? "환경 초기화" : "GPT arm reset"}</dd></div><div><dt>비용 한도</dt><dd id="live-budget">${money(project.run_config?.budget_usd)}</dd></div><div><dt>Teacher</dt><dd id="teacher-name">—</dd></div><div><dt>Reasoning</dt><dd id="teacher-effort">—</dd></div><div id="next-policy-row" hidden><dt>다음 실행</dt><dd id="next-policy">—</dd></div><div><dt>입력 / 출력 tokens</dt><dd id="live-tokens">—</dd></div><div><dt>Run</dt><dd id="live-run">—</dd></div></dl></section></div></aside></div>`;
+    $("tab-content").innerHTML = `${renderCollectionSettings(project)}<div class="collection-layout"><div><section class="panel"><div class="panel-header"><div><h2>실시간 수집</h2><p id="live-subtitle">환경을 연결한 뒤 관측을 확인하세요.</p></div><span id="live-state" class="tag neutral">준비 전</span></div><div id="live-images"><div class="live-placeholder">${icon("camera")}<h3>수집 환경을 연결하세요</h3><p>환경 연결 후 현재 카메라를 확인할 수 있습니다.<br>수집 시작을 누르기 전까지 GPT는 호출되지 않습니다.</p></div></div><div id="observation-footer" class="observation-footer"><span>카메라 대기 중</span><span>현재 프로젝트의 관측만 표시합니다.</span></div><div class="execution-meta"><div><span>현재 단계</span><strong id="live-stage">—</strong></div><div><span>Task / Reset step</span><strong id="live-steps">0 / 0</strong></div><div><span>실행 API 비용</span><strong id="live-cost">—</strong></div></div><div class="collection-record-link">${icon("database")}<span>GPT 판단 요약과 action 기록은 <a href="${routeUrl(project.id,"data")}">데이터 → Episode 상세</a>에서 확인하세요.</span></div></section><section class="panel events-panel"><div class="panel-header"><h2>실행 이벤트</h2><span id="events-count" class="tag neutral">0</span></div><ol id="events-list" class="events-list"><li class="empty-event">이 프로젝트의 실행 이벤트가 여기에 표시됩니다.</li></ol></section></div><aside class="panel control-panel"><div class="panel-header"><h2>수집 제어</h2><a class="icon-button" href="#collection-settings-panel" aria-label="수집 실행 설정" data-action="collection-settings-focus">${icon("settings")}</a></div><div class="panel-body"><section class="control-section"><span class="control-label">01 · 환경 연결</span><button id="initialize-project" class="button secondary full" data-action="connect" disabled>${icon("robot")}환경 연결</button><p id="initialize-note" class="control-note">환경 관측만 연결합니다. Run 생성과 GPT 호출은 수집 시작 시 수행합니다.</p></section><section class="control-section"><span class="control-label">02 · 데이터 수집</span><button id="start-collection" class="button primary full" data-action="start" disabled>${icon("play")}수집 시작</button><div class="control-row"><button id="pause-collection" class="button pause" data-action="pause" disabled>${icon("pause")}Pause</button><button id="step-collection" class="button secondary" data-action="step" disabled>${icon("step")}한 번만 실행</button></div><button id="stop-collection" class="button danger full" data-action="stop" style="margin-top:9px" disabled>${icon("stop")}수집 중지</button><p id="control-note" class="control-note">환경을 먼저 연결해주세요.</p></section><section class="control-section"><dl class="session-rows"><div><dt id="live-goal-label">실행 목표</dt><dd id="live-goal">${n(project.run_config?.episodes) || 1} episodes / run</dd></div><div id="next-goal-row" hidden><dt>다음 run 목표</dt><dd id="next-goal">—</dd></div><div><dt>Reset</dt><dd id="live-reset-mode">${esc(resetModeLabel(project.run_config?.reset_mode))}</dd></div><div><dt>비용 한도</dt><dd id="live-budget">${money(project.run_config?.budget_usd)}</dd></div><div><dt>Teacher</dt><dd id="teacher-name">—</dd></div><div><dt>Reasoning</dt><dd id="teacher-effort">—</dd></div><div id="next-policy-row" hidden><dt>다음 모델 설정</dt><dd id="next-policy">—</dd></div><div><dt>입력 / 출력 tokens</dt><dd id="live-tokens">—</dd></div><div><dt>Run</dt><dd id="live-run">—</dd></div></dl></section></div></aside></div>`;
     updateCollection();
+    refreshPipeline(true);
   }
 
   function updateCollection() {
     if (state.route.tab !== "collection" || !$("initialize-project")) return;
     const s = state.status || {}, p = currentProject();
     if (!p) return;
+    updateCollectionSettings();
     const own = s.active_project_id === p.id;
     const learning = pipelineRuntime(), managed = learning && pipelineActive(learning.phase), managedOwn = managed && learning.project_id === p.id;
-    const preparingOwn = state.pending === "initialize" && state.pendingProjectId === p.id;
+    const preparingOwn = state.pending === "connect" && state.pendingProjectId === p.id;
     const another = !own && !preparingOwn && activePhases.has(s.phase);
-    const ready = own && ["ready","paused"].includes(s.phase);
+    const envConnected = own && s.environment_connected === true;
     const ep = own ? s.episode || {} : {};
     const cycleDone = Boolean(ep.outcome && (s.config?.reset_mode === "environment" || ep.reset_outcome));
-    const batchDone = cycleDone && (n(ep.index) >= n(s.config?.episodes) || s.config?.reset_mode === "agent" && ep.reset_outcome !== "success");
-    const continuing = own && ["completed","paused"].includes(s.phase) && s.stage === "reset" && s.observation?.success && s.config?.seed === p.run_config?.seed && s.config?.task_id === p.task_id;
-    const canInit = !another && (!own || ["idle","stopped","completed","error"].includes(s.phase) || continuing);
+    const batchDone = cycleDone && (n(ep.index) >= n(s.config?.episodes) || s.config?.reset_mode !== "environment" && ep.reset_outcome !== "success");
+    const newRunReady = own && s.can_start_new_run === true;
+    const resumable = own && ["ready","paused"].includes(s.phase) && !batchDone;
+    const ready = newRunReady || resumable;
+    const reconnect = own && ["stopped","error","completed"].includes(s.phase) && !newRunReady;
+    const canConnect = !another && (!envConnected || reconnect) && (!own || !activePhases.has(s.phase));
     const runnable = p.runnable !== false && state.detail.runnable !== false;
     const locked = Boolean(state.pending || state.pausePending || !state.connected || managed);
-    $("initialize-project").disabled = locked || !runnable || !canInit;
-    $("initialize-project").innerHTML = icon("robot") + (state.pending === "initialize" ? "환경 준비 중…" : continuing ? "복구된 환경에서 이어 수집" : own && activePhases.has(s.phase) ? "환경 준비 완료" : "환경 준비");
-    $("initialize-note").textContent = continuing ? "검증된 GPT reset 상태에서 새 실행을 준비합니다. 환경을 초기화하지 않습니다." : "새 실행을 위한 환경을 초기화합니다. GPT는 아직 호출하지 않습니다.";
+    $("initialize-project").disabled = locked || !runnable || !canConnect;
+    $("initialize-project").innerHTML = icon("robot") + (state.pending === "connect" ? "환경 연결 중…" : reconnect ? "환경 다시 연결" : envConnected ? "환경 연결 완료" : "환경 연결");
+    $("initialize-note").textContent = reconnect ? "현재 장면을 초기화하고 환경을 다시 연결합니다. 수집은 시작하지 않습니다." : envConnected ? "환경이 연결되어 있습니다. 설정 변경은 다음 새 run 시작 시 적용됩니다." : "환경 관측만 연결합니다. Run 생성과 GPT 호출은 수집 시작 시 수행합니다.";
     const hasPolicy = s.policy !== "openai" || s.api_key_configured;
-    $("start-collection").disabled = locked || !ready || batchDone || !hasPolicy;
-    $("start-collection").innerHTML = icon("play") + (own && s.phase === "paused" ? "수집 재개" : "수집 시작");
+    $("start-collection").disabled = locked || state.collectionSettingsSaving || !ready || !hasPolicy;
+    $("start-collection").innerHTML = icon("play") + (own && s.phase === "paused" && resumable ? "수집 재개" : "수집 시작");
     $("pause-collection").disabled = state.pausePending || !state.connected || !(own || preparingOwn) || !pausePhases.has(s.phase);
     $("pause-collection").innerHTML = icon("pause") + (state.pausePending ? "요청 중…" : "Pause");
-    $("step-collection").disabled = locked || !ready || batchDone || !hasPolicy;
+    $("step-collection").disabled = locked || state.collectionSettingsSaving || !hasPolicy || !(newRunReady || own && s.phase === "ready" && s.run_started === false);
+    $("step-collection").innerHTML = icon("step") + "한 번만 실행";
     $("stop-collection").disabled = locked || !own || !activePhases.has(s.phase);
-    const note = state.pausePending ? "일시정지를 요청했습니다. 환경 초기화 중이면 초기화가 끝난 뒤 적용됩니다." : !runnable ? p.runnable_reason || state.detail.runnable_reason || "현재 서버에서 이 프로젝트 환경을 실행할 수 없습니다." : another ? "다른 실행에서 환경을 사용 중입니다. 활성 프로젝트 또는 실행 콘솔에서 해당 실행을 중지한 뒤 준비할 수 있습니다." : !hasPolicy ? "서버에 API key가 설정되지 않았습니다. 환경 관측만 확인할 수 있습니다." : own && s.error ? s.error : own && s.phase === "paused" ? "일시정지 상태입니다. 재개하면 새 관측으로 다음 동작을 판단합니다." : own && s.phase === "completed" ? "실행이 종료되었습니다. 결과는 데이터 탭에서 확인하세요." : own && s.phase === "thinking" ? "GPT가 다음 동작을 판단하고 있습니다. Pause하면 대기 중 응답을 폐기합니다." : own && s.phase === "executing" ? "Action을 실행하고 있습니다. Pause는 현재 control tick이 끝난 뒤 적용됩니다." : ready ? "수집 시작은 연속 실행, 한 번 실행은 GPT 판단 1회 후 일시정지합니다." : "환경을 먼저 준비해주세요.";
+    const note = state.pausePending ? "일시정지를 요청했습니다. 현재 control tick 또는 환경 작업이 끝나면 적용됩니다." : !runnable ? p.runnable_reason || state.detail.runnable_reason || "현재 서버에서 이 프로젝트 환경을 실행할 수 없습니다." : another ? "다른 실행에서 환경을 사용 중입니다. 해당 실행을 중지한 뒤 연결할 수 있습니다." : !hasPolicy ? "서버에 API key가 설정되지 않았습니다. 환경 관측만 확인할 수 있습니다." : own && s.error ? s.error : own && s.phase === "paused" ? "일시정지 상태입니다. 재개하면 현재 run의 모델·목표·reset 설정을 유지합니다." : own && s.phase === "thinking" ? "GPT가 다음 동작 또는 수집 기준을 판단하고 있습니다. Pause하면 대기 중 응답을 폐기합니다." : own && s.phase === "executing" ? "Action을 실행하고 있습니다. Pause는 현재 control tick이 끝난 뒤 적용됩니다." : ready ? `수집 시작은 설정된 ${n(p.run_config?.episodes) || 1} episodes를, 한 번만 실행은 1 episode와 reset을 수행합니다. 완료 후 자동으로 다음 run을 시작하지 않습니다.` : reconnect ? "안전하게 이어갈 수 없는 상태입니다. 환경 다시 연결로 현재 장면을 초기화한 뒤 새 run을 시작하세요." : "환경을 먼저 연결해주세요.";
     $("control-note").textContent = note;$("control-note").classList.toggle("alert",Boolean(!runnable || another || !hasPolicy || own && s.error));
     $("pause-collection").dataset.action = managedOwn ? "pipeline-pause" : "pause";
     $("stop-collection").dataset.action = managedOwn ? "pipeline-stop" : "stop";
@@ -491,34 +1370,39 @@
       $("pause-collection").disabled = learning.phase !== "running" || state.pipelinePausePending || !state.connected;
       $("pause-collection").innerHTML = icon("pause") + (state.pipelinePausePending ? "요청 중…" : "Pause");
       $("stop-collection").disabled = Boolean(state.pipelinePending || !state.connected);
-      $("control-note").textContent = `${pipelineStageName(learning.stage)} 단계가 파이프라인에서 ${learning.phase === "paused" ? "일시정지되어 있습니다" : "진행 중입니다"}. 재개와 단계 실행은 모델 탭에서 관리하세요.`;
+      $("control-note").textContent = `${pipelineStageName(learning.stage)} 단계가 파이프라인에서 ${learning.phase === "paused" ? "일시정지되어 있습니다" : "진행 중입니다"}. 전체 실행의 Pause·재개는 개요에서 관리하세요.`;
       $("control-note").classList.remove("alert");
       $("initialize-note").textContent = "파이프라인이 환경을 관리합니다. 학습 중에는 수집을 멈추고 다음 rollout에서 이어갑니다.";
-    } else if (managed) $("control-note").textContent = "다른 프로젝트의 파이프라인이 환경을 사용 중입니다. 모델 탭에서 실행 상태를 확인하세요.";
-    $("live-state").className = `tag ${own && activePhases.has(s.phase) ? s.phase === "paused" ? "warning" : "success" : "neutral"}`;
+    } else if (managed) $("control-note").textContent = "다른 프로젝트의 파이프라인이 환경을 사용 중입니다. 개요에서 실행 상태를 확인하세요.";
+    $("live-state").className = `tag ${own && (activePhases.has(s.phase) || envConnected) ? s.phase === "paused" ? "warning" : "success" : "neutral"}`;
     $("live-state").textContent = own ? s.phase === "thinking" && s.stage !== "reset" && ["bc_eval","rl","rl_eval"].includes(s.learning?.pipeline_stage) ? "학습 정책 action 계산 중" : phaseNames[s.phase] || s.phase : "준비 전";
-    $("live-subtitle").textContent = own ? `Episode ${n(ep.index) || 1} / ${n(s.config?.episodes) || 1} · ${s.stage === "reset" ? "GPT가 환경을 복구하고 있습니다." : "Task를 수행하는 관측과 실행 기록"}` : "실행 환경을 준비한 뒤 관측을 확인하세요.";
-    $("live-stage").textContent = own && s.observation ? s.stage === "reset" ? "GPT Reset" : s.learning?.pipeline_stage && s.learning.pipeline_stage !== "collect" ? pipelineStageName(s.learning.pipeline_stage) : "Task" : "—";
+    $("live-subtitle").textContent = own && s.run_id ? `Episode ${episodeIndex(ep.display_index ? ep : findEpisode(s.run_id,ep.id) || ep)} · run ${n(ep.index) || 1} / ${n(s.config?.episodes) || 1} · ${s.stage === "reset" ? "GPT가 환경을 복구하고 있습니다." : "Task를 수행하는 관측과 실행 기록"}` : envConnected ? "환경 연결됨 · 설정을 저장한 뒤 수집을 시작하세요." : "환경을 연결한 뒤 관측을 확인하세요.";
+    $("live-stage").textContent = own && s.run_id && s.observation ? s.stage === "reset" ? "GPT Reset" : s.learning?.pipeline_stage && s.learning.pipeline_stage !== "collect" ? pipelineStageName(s.learning.pipeline_stage) : "Task" : "—";
     const shownRun = own && s.run_id ? s.config || {} : p.run_config || {};
     $("live-goal").textContent = `${n(shownRun.episodes) || 1} episodes / run`;
-    $("live-reset-mode").textContent = shownRun.reset_mode === "environment" ? "환경 초기화" : "GPT arm reset";
+    $("live-goal-label").textContent = own && s.run_id ? activePhases.has(s.phase) ? "현재 run 목표" : "마지막 run 목표" : "수집 목표";
+    $("next-goal-row").hidden = !(own && s.run_id && n(shownRun.episodes) !== n(p.run_config?.episodes));
+    $("next-goal").textContent = `${n(p.run_config?.episodes) || 1} episodes / run`;
+    $("next-goal-row").title = s.run_started ? "시작한 run은 Pause·재개 시에도 현재 목표를 유지합니다." : "다음 새 run에 적용되는 저장된 목표입니다.";
+    $("live-reset-mode").textContent = resetModeLabel(shownRun.reset_mode);
     $("live-budget").textContent = money(shownRun.budget_usd);
     $("live-steps").textContent = `${count(ep.steps)} / ${count(ep.reset_steps)}`;
     $("live-cost").textContent = own ? money(s.stats?.estimated_cost_usd,4) : "—";
     const selectedPolicy = nextPolicy(p), shownPolicy = own && s.run_id ? s : selectedPolicy;
     $("teacher-name").textContent = s.policy === "scripted" ? "Scripted demo" : shownPolicy.model || "—";
-    $("teacher-effort").textContent = s.policy === "scripted" ? "—" : shownPolicy.reasoning_effort || "—";
+    $("teacher-effort").textContent = s.policy === "scripted" ? "—" : effortLabel(shownPolicy.reasoning_effort,shownPolicy.current_reasoning_effort);
     $("next-policy-row").hidden = !(own && s.run_id && s.policy !== "scripted" && (s.model !== selectedPolicy.model || s.reasoning_effort !== selectedPolicy.reasoning_effort));
     $("next-policy").textContent = policyLabel(selectedPolicy);
     $("live-tokens").textContent = own ? `${count(s.stats?.input_tokens)} / ${count(s.stats?.output_tokens)}` : "—";
     $("live-run").textContent = own ? s.run_id || "—" : "—";
     const observation = own ? s.observation : null;
     if (observation) {
-      const cameras = Array.isArray(observation.cameras) ? observation.cameras.map(x => typeof x === "string" ? x : x.name).filter(Boolean) : Object.keys(observation.cameras || {});
+      const cameras = (Array.isArray(observation.cameras) ? observation.cameras.map(x => typeof x === "string" ? x : x.name) : Object.keys(observation.cameras || {})).filter(name => typeof name === "string" && name && !/^reset_reference(?:_|$)/.test(name));
       const signature = cameras.join("|");
       if (signature !== state.lastCameras) {
-        $("live-images").innerHTML = `<div class="camera-grid ${cameras.length === 1 ? "single" : ""}">${cameras.map((camera,index) => `<div class="camera ${camera.includes("reference") ? "reference" : ""}"><span class="camera-label">${esc(camera.includes("reference") ? "초기 상태 참고 이미지" : camera)}</span><img id="live-camera-${index}" alt="${esc(camera)} 현재 관측"></div>`).join("")}</div>`;
+        $("live-images").innerHTML = `<div class="camera-grid ${cameras.length === 1 ? "single" : ""}">${cameras.map((camera,index) => `<div class="camera"><span class="camera-label">${esc(camera)}</span><img id="live-camera-${index}" alt="${esc(camera)} 현재 관측"></div>`).join("")}</div>`;
         state.lastCameras = signature;
+        state.lastObservation = null;
       }
       if (observation.id !== state.lastObservation) {
         cameras.forEach((camera,index) => {$("live-camera-"+index).src = `/api/frame/${encodeURIComponent(camera)}?observation_id=${encodeURIComponent(observation.id)}`;});
@@ -526,7 +1410,7 @@
       }
       $("observation-footer").innerHTML = `<span>마지막 관측 ${esc(date(observation.timestamp,{second:"2-digit"}))}</span><span>관측 ID ${esc(String(observation.id).split(":").slice(-2).join(":"))}</span>`;
     } else if (state.lastObservation !== null || state.lastCameras) {
-      $("live-images").innerHTML = `<div class="live-placeholder">${icon("camera")}<h3>수집 환경을 준비하세요</h3><p>현재 프로젝트에 연결된 실시간 관측이 없습니다.<br>환경 준비 후 카메라를 확인할 수 있습니다.</p></div>`;
+      $("live-images").innerHTML = `<div class="live-placeholder">${icon("camera")}<h3>수집 환경을 연결하세요</h3><p>현재 프로젝트에 연결된 실시간 관측이 없습니다.<br>환경 연결 후 카메라를 확인할 수 있습니다.</p></div>`;
       $("observation-footer").innerHTML = "<span>카메라 대기 중</span><span>현재 프로젝트의 관측만 표시합니다.</span>";
       state.lastObservation = null;state.lastCameras = "";
     }
@@ -542,13 +1426,14 @@
   function dashboardEventMessage(event) {
     const message = event.message || "";
     let match = message.match(/^Episode (\d+) started/);
-    if (match) return `Episode ${match[1]} 시작`;
+    if (match) return `Episode ${episodeIndex(findEpisode(event.run_id,event.episode_id) || {index:Number(match[1])})} 시작`;
     match = message.match(/^Episode (\d+) ended: (.+)\.$/);
-    if (match) return `Episode ${match[1]} Task ${match[2] === "success" ? "성공" : `종료 (${match[2]})`}`;
+    if (match) return `Episode ${episodeIndex(findEpisode(event.run_id,event.episode_id) || {index:Number(match[1])})} Task ${match[2] === "success" ? "성공" : `종료 (${match[2]})`}`;
     if (message.startsWith("GPT reset started")) return "GPT reset 시작 · 현재 환경에서 복구합니다.";
     if (message.startsWith("GPT reset ended: success")) return "GPT reset 완료 · 환경 복구 검증을 통과했습니다.";
     if (message.startsWith("GPT reset ended:")) return "GPT reset 미완료 · 환경을 확인해주세요.";
-    if (message.startsWith("Environment initialized")) return "환경 준비 완료 · 관측을 확인한 뒤 수집을 시작하세요.";
+    if (message.startsWith("Environment initialized")) return "Run 준비 완료 · 설정을 실행 기록에 저장했습니다.";
+    if (message.startsWith("Environment connected")) return "환경 연결 완료 · 수집 시작 전까지 GPT를 호출하지 않습니다.";
     if (message === "Execution resumed.") return "수집 실행 / 재개";
     if (message.startsWith("Execution stopped")) return "수집 중지 · 실행 기록을 저장했습니다.";
     if (message.startsWith("Paused.")) return "일시정지 · 재개할 때 현재 상태를 다시 관측합니다.";
@@ -564,7 +1449,7 @@
     document.title = `${project.name} · RILO`;
     $("content").innerHTML = projectShell(project);
     renderBreadcrumb();
-    ({overview:renderOverview,collection:renderCollection,data:renderData,models:renderModels,settings:renderSettings}[state.route.tab] || renderOverview)(project);
+    ({overview:renderOverview,collection:renderCollection,data:renderData,models:renderModels,evaluation:renderEvaluation,settings:renderSettings}[state.route.tab] || renderOverview)(project);
   }
 
   async function refreshWorkspace(force = false) {
@@ -577,7 +1462,7 @@
       state.workspace = data;state.workspaceSignature = signature;
       renderNav();renderGlobal();
       if (!state.route.id && (changed || force) && document.activeElement?.id !== "project-search") renderHome();
-      if (state.route.id && (force || !["settings","collection","models"].includes(state.route.tab))) await loadDetail(false);
+      if (state.route.id && (force || !["settings","collection","models","evaluation"].includes(state.route.tab))) await loadDetail(false);
       $("freshness").textContent = `최근 동기화 ${new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit",hour12:false})}`;
       if (state.connected) showError(null);
     } catch (error) { if (!state.workspace || force) showError(error.message); }
@@ -593,11 +1478,11 @@
       if (requestId !== state.statusRequest) return;
       state.status = status;state.connected = true;
       $("connection").className = "connection online";$("connection").innerHTML = "<i></i>서버 연결됨";
-      renderGlobal();updateCollection();updatePolicyStatus();
+      renderGlobal();updateCollection();updatePolicyStatus();updateEpisodeVideo();updatePipelineStartPreview();updateStageStartDialog();updateEvaluationLive();
     } catch {
       if (requestId !== state.statusRequest) return;
       state.connected = false;$("connection").className = "connection offline";$("connection").innerHTML = "<i></i>연결 확인 필요";
-      renderGlobal();updateCollection();
+      renderGlobal();updateCollection();updateEpisodeVideo();updatePipelineStartPreview();updateStageStartDialog();updateEvaluationLive();
     } finally { if (requestId === state.statusRequest) state.statusBusy = false; }
   }
 
@@ -610,10 +1495,11 @@
       const signature = JSON.stringify([detail.project,detail.episodes,detail.archived_episodes]);
       const changed = signature !== state.detailSignature;
       state.detail = detail;state.detailSignature = signature;
-      if (force || changed && !["settings","collection","models"].includes(state.route.tab)) renderProject();
+      if (force || changed && !["settings","collection","models","evaluation"].includes(state.route.tab)) renderProject();
       else if (state.route.tab === "collection") updateCollection();
-      else if (state.route.tab === "models") updatePipelineView();
+      else if (["models","evaluation"].includes(state.route.tab)) updatePipelineView();
       if (state.route.tab === "overview") refreshPipeline();
+      if (state.episodeDetail && $("episode-dialog").open) refreshEpisodeVideoJob();
     } catch (error) {
       if (token !== state.routeToken) return;
       if (force) $("content").innerHTML = `<a class="back-link" href="#/">${icon("back")}워크스페이스로</a><section class="panel"><div class="empty-state">${esc(error.message)}</div></section>`;
@@ -625,11 +1511,19 @@
     const pieces = location.hash.replace(/^#\/?/,"").split("/");
     let id = null;
     try { id = pieces[0] === "projects" && pieces[1] ? decodeURIComponent(pieces[1]) : null; } catch { id = null; }
-    const tabs = ["overview","collection","data","models","settings"];
+    const tabs = ["overview","collection","data","models","evaluation","settings"];
     const tab = tabs.includes(pieces[2]) ? pieces[2] : "overview";
-    state.route = {id,tab};state.routeToken += 1;state.detailSignature = "";
+    state.dataSelection = null;state.bulkEpisodeTarget = null;
+    if ($("bulk-episode-dialog").open) $("bulk-episode-dialog").close();
+    state.route = {id,tab};state.routeToken += 1;state.detailSignature = "";state.evaluationFrameToken += 1;state.evaluationCameraSignature = "";state.evaluationObservationKey = "";
+    if ($("episode-dialog").open) $("episode-dialog").close();
     if (state.detail?.project?.id !== id) {state.detail = null;state.pipeline = null;state.pipelineProjectId = null;}
-    state.pipelineDirty = false;
+    state.collectionSettingsDirty = false;state.collectionSettingsSignature = "";state.collectionSettingsExpanded = false;
+    if ($("pipeline-start-dialog").open) $("pipeline-start-dialog").close();
+    if ($("stage-start-dialog").open) $("stage-start-dialog").close();
+    if ($("bc-history-dialog").open) $("bc-history-dialog").close();
+    closeBCHistory();
+    state.trainingAlgorithms = {};
     renderNav();renderBreadcrumb();
     if (!id) { if (state.workspace) renderHome(); return; }
     $("content").innerHTML = '<div class="loading-view"><span class="spinner"></span><p>프로젝트를 불러오고 있어요.</p></div>';
@@ -639,21 +1533,17 @@
   async function command(action, global = false) {
     if (action === "pause" ? state.pausePending : state.pending || state.pausePending) return;
     const id = global ? activeId() : state.route.id;
-    const unownedPause = action === "pause" && (global && !id || state.pending === "initialize" && state.pendingProjectId === id && activeId() !== id);
+    const unownedPause = action === "pause" && (global && !id || state.pending === "connect" && state.pendingProjectId === id && activeId() !== id);
     if (!id && !unownedPause) return;
     let payload = {};
-    if (action === "initialize") {
-      const s = state.status || {}, p = currentProject();
-      payload.preserve_environment = s.active_project_id === id && ["completed","paused"].includes(s.phase) && s.stage === "reset" && Boolean(s.observation?.success) && s.config?.seed === p?.run_config?.seed && s.config?.task_id === p?.task_id;
-    }
     if (action === "pause") state.pausePending = true;
     else {state.pending = action;state.pendingProjectId = id;}
     renderGlobal();updateCollection();
     try {
-      await api(unownedPause ? "/api/pause" : `/api/projects/${encodeURIComponent(id)}/${action}`,payload,action === "initialize" || action === "pause" && state.pending === "initialize" ? 120000 : 15000);
+      await api(unownedPause ? "/api/pause" : `/api/projects/${encodeURIComponent(id)}/${action}`,payload,["connect","start","step"].includes(action) || action === "pause" && state.pending === "connect" ? 120000 : 15000);
       // A delayed Start response must never replace a newer Pause snapshot.
       await refreshStatus(true);
-      const messages = {initialize:"환경이 준비되었습니다. 관측을 확인한 뒤 수집을 시작하세요.",start:"수집 실행을 요청했습니다.",resume:"수집 재개를 요청했습니다.",pause:"일시정지했습니다.",step:"GPT 판단 한 번을 실행합니다.",stop:"수집을 중지했습니다. 기록은 유지됩니다."};
+      const messages = {connect:"환경이 연결되었습니다. 설정을 확인한 뒤 수집을 시작하세요.",start:"설정한 목표로 run 하나를 시작합니다.",resume:"현재 run을 기존 설정으로 재개합니다.",pause:"일시정지했습니다.",step:"1 episode와 reset을 실행합니다. 저장된 수집 목표는 유지됩니다.",stop:"수집을 중지했습니다. 기록은 유지됩니다."};
       toast(messages[action]);
       await refreshWorkspace();
     } catch (error) { toast(error.message,true);await refreshStatus(true); }
@@ -735,11 +1625,15 @@
     event.preventDefault();
     const form = event.target, project = currentProject(), routeToken = state.routeToken;
     if (!project || !form.reportValidity()) return;
-    const data = new FormData(form), config = {...project.run_config};
-    for (const key of ["episodes","budget_usd","seed","max_steps","max_decisions","max_reset_steps","max_reset_decisions"]) config[key] = Number(data.get(key));
-    config.reset_mode = data.get("reset_mode");config.task_id = project.task_id;
-    const payload = {name:String(data.get("name")).trim(),description:String(data.get("description") || "").trim(),run_config:config,pipeline:{demo_target:Number(data.get("demo_target")),bc_success_target:Number(data.get("bc_success_target")),rl_success_target:Number(data.get("rl_success_target"))}};
-    if (!form.elements.demo_target) delete payload.pipeline;
+    const data = new FormData(form);
+    const payload = {name:String(data.get("name")).trim(),description:String(data.get("description") || "").trim()};
+    const graspInput = form.elements.expected_grasp_closures;
+    if (graspInput) {
+      const expected = String(data.get("expected_grasp_closures") ?? "").trim();
+      const saved = String(graspInput.dataset.savedExpected ?? "").trim();
+      const expectedValue = expected === "" ? null : Number(expected), savedValue = saved === "" ? null : Number(saved);
+      if (expectedValue !== savedValue) payload.expected_grasp_closures = expectedValue;
+    }
     if ((policyOptions().models || []).some(item => item.model === data.get("policy_model"))) {
       payload.policy_config = {model:String(data.get("policy_model")),reasoning_effort:String(data.get("reasoning_effort"))};
     }
@@ -747,9 +1641,13 @@
     try {
       const result = await api(`/api/projects/${encodeURIComponent(project.id)}/settings`,payload);
       const stillHere = routeToken === state.routeToken && currentProject()?.id === project.id;
-      if (stillHere) state.detail.project = result.project;
-      toast("설정을 저장했습니다. 다음 환경 준비 또는 복구 후 이어 수집부터 적용됩니다.");
-      await refreshWorkspace();renderNav();renderBreadcrumb();
+      if (stillHere) {
+        state.detail.project = result.project;
+        const panel = document.querySelector(".grasp-baseline-panel");
+        if (panel) panel.outerHTML = graspBaselinePanel(result.project);
+      }
+      toast("설정을 저장했습니다. 환경 재연결 없이 다음 새 run부터 적용됩니다. Pause·재개는 현재 run의 설정을 유지합니다.");
+      await refreshWorkspace();await refreshStatus(true);renderNav();renderBreadcrumb();
       if (routeToken === state.routeToken && currentProject()?.id === project.id) {
         const heading = document.querySelector(".project-heading h1");if (heading) heading.textContent = result.project.name;
       }
@@ -785,7 +1683,8 @@
     const project = currentProject(), ep = findEpisode(run,id);
     if (!project || !ep || ep.can_manage !== true || state.episodeMutation) return;
     state.deleteTarget = {project:project.id,run,id};
-    $("delete-episode-info").innerHTML = `<strong>${esc(project.name)} · Episode ${String(ep.index || 1).padStart(2,"0")}</strong><span>${esc(date(ep.started_at))}</span><code>${esc(run)} / ${esc(id)}</code>`;
+    $("delete-title").textContent = `${episodeLabel(ep)}을 영구 삭제할까요?`;
+    $("delete-episode-info").innerHTML = `<strong>${esc(project.name)} · ${esc(episodeLabel(ep))}</strong><span>${esc(date(ep.started_at))}</span><code>${esc(run)} / ${esc(id)}</code>`;
     $("delete-error").hidden = true;$("delete-confirm").disabled = false;
     $("delete-dialog").showModal();
   }
@@ -828,7 +1727,7 @@
     if (record.kind === "decision") {
       const decision = record.decision || {};
       const learned = record.stage !== "reset" && ["bc_eval","rl","rl_eval"].includes(state.episodeDetail?.learning?.pipeline_stage);
-      return `<details class="trace-record decision-record" ${index <= 1 ? "open" : ""} id="${id}"><summary><span class="trace-record-heading">${tag(stage,record.stage === "reset" ? "warning" : "neutral")}<strong>${learned ? "정책 action" : "GPT 판단"}</strong><span class="trace-note-preview">${esc(decision.note || decision.status || "판단 기록")}</span></span><time>${time}</time></summary><div class="trace-record-body"><p class="trace-note">${esc(decision.note || "별도 판단 요약이 기록되지 않았습니다.")}</p><div class="trace-decision-meta"><span>응답 상태: ${esc(decision.status || "—")}</span><span>관측: ${esc(decision.observation_id || "—")}</span></div>${recordActions(decision.actions)}</div></details>`;
+      return `<details class="trace-record decision-record" ${index <= 1 ? "open" : ""} id="${id}"><summary><span class="trace-record-heading">${tag(stage,record.stage === "reset" ? "warning" : "neutral")}<strong>${learned ? "정책 action" : "GPT 판단"}</strong><span class="trace-note-preview">${esc(decision.note || decision.status || "판단 기록")}</span></span><time>${time}</time></summary><div class="trace-record-body"><p class="trace-note">${esc(decision.note || "별도 판단 요약이 기록되지 않았습니다.")}</p><div class="trace-decision-meta"><span>응답 상태: ${esc(decision.status || "—")}</span><span>관측: ${esc(decision.observation_id || "—")}</span>${decision.reasoning_effort ? `<span>이번 추론: ${esc(decision.reasoning_effort)}</span>` : ""}${decision.next_reasoning_effort ? `<span>다음 추론: ${esc(decision.next_reasoning_effort)}</span>` : ""}</div>${decision.status === "reconsider" ? '<p class="field-note">동작 없이 xhigh 재판단을 요청했습니다.</p>' : ""}${recordActions(decision.actions)}</div></details>`;
     }
     if (record.kind === "receipt") {
       return `<details class="trace-record receipt-record" id="${id}"><summary><span class="trace-record-heading">${tag(stage,record.stage === "reset" ? "warning" : "neutral")}<strong>Action 실행 결과</strong><span class="trace-note-preview">${count(record.executed_steps)} / ${count(record.requested_steps)} ticks${record.interrupted ? " · 부분 실행" : ""}${record.success ? " · 성공 검증" : ""}</span></span><time>${time}</time></summary><div class="trace-record-body"><div class="trace-decision-meta"><span>요청 ${count(record.requested_steps)} ticks · 실제 실행 ${count(record.executed_steps)} ticks</span>${record.success ? tag("성공 검증","success") : ""}</div><div class="trace-states"><div><h4>실행 전 상태</h4><pre>${esc(JSON.stringify(record.state_before || {},null,2))}</pre></div><div><h4>실행 후 상태</h4><pre>${esc(JSON.stringify(record.state_after || {},null,2))}</pre></div></div></details>`;
@@ -857,10 +1756,10 @@
       detail.nextOffset = result.next_offset ?? null;
       detail.learning = result.config?.learning || {};
       const learning = detail.learning;
-      const teacher = `${result.config?.model || "기록된 모델 없음"} / ${result.config?.reasoning_effort || "—"}`;
-      $("episode-policy").textContent = `${learning.pipeline_stage ? `${pipelineStageName(learning.pipeline_stage)} · GPT teacher: ` : ""}${teacher}`;
+      const teacher = `${result.config?.model || "기록된 모델 없음"} / ${effortLabel(result.config?.reasoning_effort)}`;
+      $("episode-policy").textContent = externalEpisode(detail.episode) ? `${detail.episode.source.dataset || "외부 데이터셋"} · 외부 소스 기록` : `${learning.pipeline_stage ? `${pipelineStageName(learning.pipeline_stage)} · GPT teacher: ` : ""}${teacher}`;
       $("episode-learning-models").textContent = [learning.base_model_id ? `Base: ${learning.base_model_id}` : "",learning.residual_model_id ? `Residual: ${learning.residual_model_id}` : ""].filter(Boolean).join(" · ");
-      $("episode-learning-models").hidden = !learning.base_model_id && !learning.residual_model_id;
+      $("episode-learning-models").hidden = externalEpisode(detail.episode) || !learning.base_model_id && !learning.residual_model_id;
       $("episode-trace").querySelector(".trace-loading")?.remove();
       $("episode-trace").insertAdjacentHTML("beforeend",(result.records || []).map((record,index) => traceRecord(record,offset+index)).join(""));
       if (!detail.records.length) $("episode-trace").innerHTML = '<p class="trace-empty">이 episode에 저장된 판단·실행 기록이 없습니다.</p>';
@@ -881,66 +1780,98 @@
     const ep = findEpisode(run,id), project = currentProject();
     if (!ep || !project || ep.delete_pending) return;
     state.episodeToken += 1;
-    state.episodeDetail = {project:project.id,run,id,records:[],nextOffset:0,loading:false};
-    $("episode-title").textContent = `Episode ${String(ep.index || 1).padStart(2,"0")} · ${project.name}`;
-    const video = asset(ep.video_url), poster = asset(ep.poster_url);
-    const wall = ep.reset_finished_at && ep.started_at ? (ep.reset_finished_at-ep.started_at)/60 : ep.finished_at && ep.started_at ? (ep.finished_at-ep.started_at)/60 : null;
-    $("episode-content").innerHTML = `<div class="episode-info">${outcomeLabel(ep.outcome)}${resetLabel(ep.reset_outcome)}${ep.archived ? tag("보관됨") : ""}<span>${esc(date(ep.started_at))}</span></div><div class="episode-policy"><span>실행 모델 / 추론 수준</span><strong id="episode-policy">기록을 불러오는 중…</strong><span id="episode-learning-models" hidden></span></div>${video ? `<video controls playsinline preload="metadata" src="${esc(video)}" ${poster ? `poster="${esc(poster)}"` : ""}></video><p class="episode-video-note">시뮬레이션 시간 기준 영상 · GPT 추론 대기는 제외됩니다. 영상 재생은 로봇 제어와 연결되지 않습니다.</p>` : '<div class="episode-video-empty">이 episode의 MP4가 아직 생성되지 않았습니다.</div>'}<div class="table-wrap"><table><thead><tr><th>단계</th><th>Step</th><th>GPT 호출</th><th>Input</th><th>Output</th><th>추정 비용</th></tr></thead><tbody>${["task","reset"].map(stage => {const cost = stageCost(ep,stage);return `<tr><td>${stage === "task" ? "Task" : "Reset"}</td><td>${count(stage === "task" ? ep.steps : ep.reset_steps)}</td><td>${count(cost.api_requests ?? (stage === "task" ? ep.decisions : ep.reset_decisions))}</td><td>${count(cost.input_tokens)}</td><td>${count(cost.output_tokens)}</td><td>${money(cost.estimated_cost_usd,4)}</td></tr>`;}).join("")}</tbody></table></div><div class="episode-meta"><span>${esc(run)} / ${esc(id)}</span><span>${wall !== null ? `실제 경과 ${wall.toFixed(1)}분 · ` : ""}총 ${money(episodeCost(ep),4)}</span>${video ? `<a href="${esc(video)}" download class="table-action">${icon("download")}MP4 다운로드</a>` : ""}</div><section class="episode-trace-section"><div class="trace-heading"><h3>정책 판단과 실행 기록</h3><span id="trace-count" class="tag neutral">불러오는 중</span></div><p class="field-note">정책의 action과 실행 결과, GPT가 반환한 판단 요약입니다. 학습 rollout에는 BC action·진행도·보정 지표도 포함됩니다. 모델 내부 추론 원문은 포함되지 않습니다.</p><div id="episode-trace" class="episode-trace"><p class="trace-loading">기록을 불러오고 있습니다.</p></div><p id="trace-error" class="form-error" role="alert" hidden></p><button id="trace-more" class="button secondary trace-more" data-action="trace-more" hidden>기록 더 보기</button></section>`;
+    state.episodeDetail = {project:project.id,run,id,episode:ep,records:[],nextOffset:0,loading:false,videoJob:null,videoBusy:false,videoMutation:null,videoError:null,videoApiUnavailable:false,videoRequest:0};
+    $("episode-title").textContent = `${episodeLabel(ep)} · ${project.name}`;
+    $("episode-eyebrow").textContent = episodeLabel(ep).startsWith("Rollout") ? "ROLLOUT DETAIL" : "EPISODE DETAIL";
+    const external = externalEpisode(ep);
+    const wall = external ? null : ep.reset_finished_at && ep.started_at ? (ep.reset_finished_at-ep.started_at)/60 : ep.finished_at && ep.started_at ? (ep.finished_at-ep.started_at)/60 : null;
+    $("episode-content").innerHTML = `<div class="episode-info">${episodeOutcomeLabel(ep)}${episodeResetLabel(ep)}${ep.archived ? tag("보관됨") : ""}<span>${esc(date(ep.started_at))}</span></div>${episodeSourceDetails(ep)}<div class="episode-policy"><span>${external ? "데이터 출처" : "실행 모델 / 추론 수준"}</span><strong id="episode-policy">기록을 불러오는 중…</strong><span id="episode-learning-models" hidden></span></div><section class="episode-video-section"><div id="episode-video-player"></div><div id="episode-video-actions"></div></section><div class="table-wrap"><table><thead><tr><th>단계</th><th>Step</th><th>GPT 호출</th><th>Input</th><th>Output</th><th>추정 비용</th></tr></thead><tbody>${(external ? ["task"] : ["task","reset"]).map(stage => {const cost = stageCost(ep,stage);return `<tr><td>${stage === "task" ? "Task" : "Reset"}</td><td>${count(stage === "task" ? ep.steps : ep.reset_steps)}</td><td>${count(cost.api_requests ?? (stage === "task" ? ep.decisions : ep.reset_decisions))}</td><td>${count(cost.input_tokens)}</td><td>${count(cost.output_tokens)}</td><td>${money(cost.estimated_cost_usd,4)}</td></tr>`;}).join("")}</tbody></table></div><div class="episode-meta"><span>${esc(run)} / ${esc(id)}</span><span>${wall !== null ? `실제 경과 ${wall.toFixed(1)}분 · ` : ""}총 ${money(episodeCost(ep),4)}</span></div>${episodeQuality(ep)}<section class="episode-trace-section"><div class="trace-heading"><h3>${external ? "외부 데이터 기록" : "정책 판단과 실행 기록"}</h3><span id="trace-count" class="tag neutral">불러오는 중</span></div><p class="field-note">${external ? "외부 데이터셋의 관측과 action 기록입니다. GPT 추론이나 RILO의 reset 실행 기록은 포함하지 않습니다." : "정책의 action과 실행 결과, GPT가 반환한 판단 요약입니다. 학습 rollout에는 BC action·진행도·보정 지표도 포함됩니다. 모델 내부 추론 원문은 포함되지 않습니다."}</p><div id="episode-trace" class="episode-trace"><p class="trace-loading">기록을 불러오고 있습니다.</p></div><p id="trace-error" class="form-error" role="alert" hidden></p><button id="trace-more" class="button secondary trace-more" data-action="trace-more" hidden>기록 더 보기</button></section>`;
     if (!$("episode-dialog").open) $("episode-dialog").showModal();
+    updateEpisodeVideo();
+    refreshEpisodeVideoJob();
     loadEpisodeRecords();
   }
 
   document.addEventListener("click", event => {
     const close = event.target.closest("[data-close-dialog]");
-    if (close) {if (close.closest("dialog").id !== "delete-dialog" || !state.deleteBusy) close.closest("dialog").close();return;}
+    if (close) {
+      const dialog = close.closest("dialog");
+      if (!(dialog.id === "delete-dialog" && state.deleteBusy) && !(dialog.id === "bulk-episode-dialog" && state.bulkEpisodeBusy)) dialog.close();
+      return;
+    }
+    if (event.target.closest(".episode-select-cell")) {event.stopPropagation();return;}
     const button = event.target.closest("[data-action]");
     if (!button || button.disabled) return;
+    if (button.closest(".episode-clickable-row") && button.tagName === "BUTTON") event.stopPropagation();
     const action = button.dataset.action;
     if (action === "create") openCreate();
     else if (action === "refresh") {refreshStatus();refreshWorkspace(true);}
+    else if (action === "generate-episode-video") mutateEpisodeVideo("generate");
+    else if (action === "delete-episode-video") mutateEpisodeVideo("delete");
     else if (action === "episode") openEpisode(button.dataset.run,button.dataset.episode);
     else if (action === "archive-episode") manageEpisode(button.dataset.run,button.dataset.episode,true);
     else if (action === "restore-episode") manageEpisode(button.dataset.run,button.dataset.episode,false);
     else if (action === "delete-episode") askDeleteEpisode(button.dataset.run,button.dataset.episode);
     else if (action === "confirm-delete") deleteEpisode();
+    else if (action === "bulk-episode-select") selectBulkEpisodes(button.dataset.mode);
+    else if (action === "bulk-episode-cancel" && !state.episodeMutation) {state.dataSelection = null;renderData(currentProject());}
+    else if (action === "bulk-episode-confirm") mutateBulkEpisodes();
     else if (action === "trace-more") loadEpisodeRecords();
-    else if (action === "pipeline-mode-auto" || action === "pipeline-mode-manual") {state.pipelineMode = action === "pipeline-mode-auto" ? "auto" : "manual";updatePipelineExecution();}
-    else if (action === "pipeline-start-auto") pipelineCommand("start",{mode:"auto"});
-    else if (action === "pipeline-start-manual") pipelineCommand("start",{mode:"manual",stage:state.pipelineStage});
+    else if (action === "pipeline-start-auto") openPipelineStartDialog();
+    else if (action === "bc-history") openBCHistory(button.dataset.metric,button.dataset.model);
+    else if (action === "bc-history-view" && bcHistoryIsCurrent()) {state.bcHistory.metric = button.dataset.metric;state.bcHistory.followLatest = true;renderBCHistory();}
+    else if (action === "bc-history-latest" && bcHistoryIsCurrent()) updateBCHistoryPoint(latestBCHistoryIndex(state.bcHistory.points,state.bcHistory.metric),true);
+    else if (action === "pipeline-start-manual") openStageStartDialog(button.dataset.stage || selectedPipelineStage());
     else if (action === "pipeline-pause") pipelineCommand("pause");
     else if (action === "pipeline-resume") pipelineCommand("resume");
     else if (action === "pipeline-stop") pipelineCommand("stop");
     else if (action === "pipeline-global-pause") pipelineCommand("pause",{},button.dataset.project);
     else if (action === "pipeline-refresh") refreshPipeline(true);
-    else if (action === "pipeline-config-discard") {renderPipelineConfig();updatePipelineExecution();}
-    else if (action === "data-active" || action === "data-archived") {state.dataView = action === "data-archived" ? "archived" : "active";renderData(currentProject());}
+    else if (action === "collection-settings-toggle") setCollectionSettingsExpanded(!state.collectionSettingsExpanded);
+    else if (action === "collection-settings-focus") {event.preventDefault();setCollectionSettingsExpanded(true);$("collection-settings-panel")?.scrollIntoView({behavior:"smooth",block:"start"});}
+    else if (action === "data-active" || action === "data-archived") {state.dataSelection = null;state.dataView = action === "data-archived" ? "archived" : "active";renderData(currentProject());}
     else if (action === "global-pause") command("pause",true);
-    else if (["initialize","start","pause","stop","step"].includes(action)) command(action === "start" && state.status?.phase === "paused" ? "resume" : action);
+    else if (["connect","start","pause","stop","step"].includes(action)) command(action === "start" && state.status?.phase === "paused" ? "resume" : action);
+  });
+  document.addEventListener("keydown", event => {
+    if (!["Enter"," "].includes(event.key) || event.target.closest("button,a,input,select,textarea")) return;
+    const row = event.target.closest(".episode-clickable-row[data-action=episode]");
+    if (!row) return;
+    event.preventDefault();openEpisode(row.dataset.run,row.dataset.episode);
   });
   document.addEventListener("input", event => {
+    if (event.target.id === "bc-history-point-range") updateBCHistoryPoint(Number(event.target.value));
     if (event.target.id === "project-search") {state.search = event.target.value;renderProjectCards();}
     if (event.target.id === "create-name") event.target.dataset.auto = "false";
-    if (event.target.closest("#pipeline-config-form")) {
-      state.pipelineDirty = true;
-      $("pipeline-config-state").textContent = "저장하지 않은 변경";$("pipeline-config-state").className = "tag warning";
-      updatePipelineExecution();
-    }
+    if (event.target.closest("#collection-settings-form")) state.collectionSettingsDirty = true;
+    if (event.target.closest("#pipeline-start-form")) updatePipelineStartPreview();
   });
   document.addEventListener("change", event => {
     if (event.target.id === "create-suite") loadTasks();
     if (event.target.id === "create-task") updateCreateTask();
-    if (event.target.id === "episode-filter") {state.filter = event.target.value;renderData(currentProject());}
+    if (event.target.id === "episode-select-all" || event.target.matches("input[data-episode-select]")) toggleEpisodeSelection(event.target);
+    if (event.target.id === "episode-filter") {state.dataSelection = null;state.filter = event.target.value;renderData(currentProject());}
     if (event.target.id === "policy-model") {updatePolicyEfforts();updatePolicyStatus();}
     if (event.target.id === "policy-effort") updatePolicyStatus();
-    if (event.target.id === "pipeline-manual-stage") {state.pipelineStage = event.target.value;updatePipelineExecution();}
+    if (event.target.id === "pipeline-manual-stage" && state.route.tab === "evaluation" && manualPipelineStages().some(stage => stage.id === event.target.value)) {state.evaluationStage = event.target.value;updatePipelineExecution();renderPipelineMonitor();}
+    if (event.target.dataset.trainingAlgorithm && ["bc","rl"].includes(event.target.dataset.trainingAlgorithm)) {state.trainingAlgorithms[event.target.dataset.trainingAlgorithm] = event.target.value;updatePipelineExecution();}
   });
   document.addEventListener("submit", event => {
     if (event.target.id === "settings-form") saveSettings(event);
-    if (event.target.id === "pipeline-config-form") savePipelineConfig(event);
+    if (event.target.id === "stage-start-form") submitStageStart(event);
+    if (event.target.id === "pipeline-start-form") submitPipelineStart(event);
+    if (event.target.id === "collection-settings-form") saveCollectionSettings(event);
   });
+  $("pipeline-start-dialog").addEventListener("close", () => {state.pipelineDialog = null;});
+  $("stage-start-dialog").addEventListener("close", () => {state.stageDialog = null;});
+  $("bc-history-dialog").addEventListener("close",closeBCHistory);
+  document.addEventListener("pointermove",inspectBCHistoryPointer);
+  document.addEventListener("pointerdown",inspectBCHistoryPointer);
   $("create-form").addEventListener("submit",createProject);
   $("episode-dialog").addEventListener("close", () => {const video = $("episode-content").querySelector("video");if (video) video.pause();state.episodeToken += 1;state.episodeDetail = null;});
   $("delete-dialog").addEventListener("cancel", event => {if (state.deleteBusy) event.preventDefault();});
+  $("bulk-episode-dialog").addEventListener("cancel", event => {if (state.bulkEpisodeBusy) event.preventDefault();});
+  $("bulk-episode-dialog").addEventListener("close", () => {state.bulkEpisodeTarget = null;});
   window.addEventListener("hashchange",navigate);
   fillIcons();
   navigate();

@@ -33,6 +33,9 @@ class DemoAdapter:
     def describe(self) -> dict:
         return {"name": "Demo · 2D point target", "simulation": True,
                 "description": "A deterministic UI/runner smoke test, not LIBERO or a robot learning benchmark.",
+                "free_space_reset": {"supported": True, "simulation_only": True,
+                    "verification": "The demo point must return within 0.045 canvas units of its initial position. "
+                                    "The 2D demo has no collision obstacles, gripper, or background dynamics."},
                 "action_spec": self.action_spec.to_dict()}
 
     def list_tasks(self) -> list[dict]:
@@ -54,6 +57,10 @@ class DemoAdapter:
         self.target = self._initial_position.copy()
         self.steps = 0
         return self._observe()
+
+    def begin_free_space_reset(self) -> Observation:
+        """The deterministic demo's return predicate is its endpoint verifier."""
+        return self.begin_reset()
 
     def begin_task(self) -> Observation:
         self.stage = "task"

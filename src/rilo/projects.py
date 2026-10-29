@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -68,6 +69,7 @@ class ProjectSettings(BaseModel):
     run_config: RunConfig | None = None
     pipeline: PipelineGoals | None = None
     policy_config: PolicyConfig | None = None
+    expected_grasp_closures: int | None = Field(default=None, strict=True, ge=0, le=100)
 
     @field_validator("name")
     @classmethod
@@ -142,6 +144,62 @@ class ProjectStore:
         state = self._load() if state is None else state
         return state.get("episode_state", {}).get(run_id, {}).get(episode_id, {})
 
+    def sync_episode_numbers(self):
+        """Assign stable project-wide display numbers without rewriting recordings.
+
+        Existing retained episodes are numbered in run chronology on first use.
+        Later discoveries append, and deletion leaves its allocated number in
+        the registry so a newer episode cannot silently inherit that identity.
+        """
+        with self._lock:
+            state = self._load()
+            changed = False
+            registry = state.setdefault("episode_state", {})
+            for project in state["projects"]:
+                candidates = []
+                highwater = project.get("last_episode_number", 0)
+                if type(highwater) is not int or highwater < 0:
+                    highwater = 0
+                for run_id in project["run_ids"]:
+                    for metadata in registry.get(run_id, {}).values():
+                        number = metadata.get("display_index")
+                        if type(number) is int and number > 0:
+                            highwater = max(highwater, number)
+                    try:
+                        root = self._run_path(run_id)
+                        if root.is_symlink():
+                            continue
+                        created_at = _number(_json(root / "manifest.json").get("created_at"))
+                        for path in root.glob("episode-*"):
+                            if (not re.fullmatch(r"episode-\d{4,}", path.name)
+                                    or path.is_symlink() or not path.is_dir()):
+                                continue
+                            metadata = registry.get(run_id, {}).get(path.name, {})
+                            if metadata.get("deleted_at"):
+                                continue
+                            number = metadata.get("display_index")
+                            if type(number) is int and number > 0:
+                                continue
+                            candidates.append((created_at, run_id, int(path.name.split("-")[-1]), path.name))
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        continue
+                for _, run_id, _, episode_id in sorted(candidates):
+                    highwater += 1
+                    registry.setdefault(run_id, {}).setdefault(episode_id, {})["display_index"] = highwater
+                    changed = True
+                if highwater and project.get("last_episode_number") != highwater:
+                    project["last_episode_number"] = highwater
+                    changed = True
+            if changed:
+                self._save(state)
+
+    def episode_display_index(self, project_id, run_id, episode_id):
+        project = self.get(project_id)  # Also discovers/assigns a newly started episode.
+        if run_id not in project["run_ids"]:
+            raise KeyError("Episode does not belong to this project")
+        self._episode_path(run_id, episode_id)
+        return self._episode_state(run_id, episode_id).get("display_index")
+
     def _require_episode(self, project_id, run_id, episode_id):
         self._episode_path(run_id, episode_id)
         project = self.get(project_id)
@@ -215,16 +273,11 @@ class ProjectStore:
             existing = self._episode_state(run_id, episode_id, state=state)
             if existing.get("deleted_at") and not existing.get("delete_pending"):
                 return
-            retained_usage = existing.get("retained_usage", {})
             if not existing.get("deleted_at"):
-                _, _, summary = self._require_episode(project_id, run_id, episode_id)
-                retained_usage = {key: sum(_number(stage.get(key)) for stage in summary.get("costs", {}).values())
-                    for key in ("input_tokens", "output_tokens", "total_tokens", "api_requests",
-                                "estimated_cost_usd", "unknown_usage_requests")}
+                self._require_episode(project_id, run_id, episode_id)
             episode, metadata_paths, media_paths = self._deletion_files(run_id, episode_id)
             metadata = state.setdefault("episode_state", {}).setdefault(run_id, {}).setdefault(episode_id, {})
-            metadata.update(deleted_at=existing.get("deleted_at", time.time()), delete_pending=True,
-                            retained_usage=retained_usage)
+            metadata.update(deleted_at=existing.get("deleted_at", time.time()), delete_pending=True)
             self._save(state)
             if episode.exists():
                 shutil.rmtree(episode)
@@ -271,7 +324,7 @@ class ProjectStore:
                     if kind in ("environment_reset", "agent_reset_continuation"):
                         row = {"kind": "episode_start", "recorded_at": row.get("recorded_at"),
                                "stage": "task", "start_kind": kind, "seed": row.get("seed")}
-                    elif kind not in ("decision", "receipt", "stage_start", "stage_end", "episode_end", "control", "policy_transition"):
+                    elif kind not in ("decision", "receipt", "stage_start", "stage_end", "episode_end", "control", "policy_transition", "gripper_close"):
                         continue
                     # Decisions contain the public action explanation (note),
                     # never the provider's hidden reasoning. Large per-tick
@@ -336,6 +389,7 @@ class ProjectStore:
     def list(self):
         with self._lock:
             self.import_history()
+            self.sync_episode_numbers()
             return sorted(deepcopy(self._load()["projects"]), key=lambda p: p["updated_at"], reverse=True)
 
     def get(self, project_id):
@@ -350,10 +404,14 @@ class ProjectStore:
             project = next((p for p in state["projects"] if p["id"] == project_id), None)
             if project is None:
                 raise KeyError(project_id)
-            changes = data.model_dump(exclude_none=True)
+            changes = data.model_dump(exclude_none=True, exclude={"expected_grasp_closures"})
             if "run_config" in changes:
                 changes["run_config"]["task_id"] = project["task_id"]
             project.update(changes, updated_at=time.time())
+            if "expected_grasp_closures" in data.model_fields_set:
+                self._set_grasp_baseline(state, project,
+                    {"expected_closures": data.expected_grasp_closures}
+                    if data.expected_grasp_closures is not None else None, source="manual")
             self._save(state)
             return deepcopy(project)
 
@@ -370,6 +428,39 @@ class ProjectStore:
                 project["run_ids"].append(run_id)
                 project["updated_at"] = time.time()
                 self._save(state)
+
+    def _baseline_key(self, project):
+        identity = [project["backend"], project["suite"], project["task_id"]]
+        return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+    def grasp_baseline(self, project):
+        return deepcopy(self._load().get("grasp_baselines", {}).get(self._baseline_key(project)))
+
+    def set_grasp_baseline(self, project_id, value, *, source="manual"):
+        with self._lock:
+            project = self.get(project_id)
+            state = self._load()
+            record = self._set_grasp_baseline(state, project, value, source=source)
+            self._save(state)
+            return deepcopy(record)
+
+    def _set_grasp_baseline(self, state, project, value, *, source):
+        """Stage a task-wide baseline in the same atomic write as other settings."""
+        expected = value.get("expected_closures") if value is not None else None
+        if expected is not None and (type(expected) is not int or not 0 <= expected <= 100):
+            raise ValueError("Expected gripper closures must be 0–100 or unknown")
+        key = self._baseline_key(project)
+        records = state.setdefault("grasp_baselines", {})
+        version = state.setdefault("grasp_baseline_versions", {}).get(key, 0) + 1
+        state["grasp_baseline_versions"][key] = version
+        if value is None:
+            records.pop(key, None)
+            return None
+        record = {"expected_closures": expected, "rationale": value.get("rationale", "Operator reference"),
+            "assumptions": value.get("assumptions", []), "source": source,
+            "version": version, "updated_at": time.time()}
+        records[key] = record
+        return record
 
     def media_path(self, filename):
         if Path(filename).name != filename or Path(filename).suffix.lower() not in (".mp4", ".jpg", ".jpeg", ".png"):
@@ -399,6 +490,8 @@ class ProjectStore:
     def read_run(self, run_id, *, media=None, episode_state=None):
         root = self._run_path(run_id)
         manifest = _json(root / "manifest.json")
+        if episode_state is None:
+            self.sync_episode_numbers()
         episode_state = (self._load().get("episode_state", {}).get(run_id, {})
                          if episode_state is None else episode_state)
         summaries = []
@@ -427,6 +520,26 @@ class ProjectStore:
                     "run_id": run_id, "archived": True, "delete_pending": True,
                     "archived_at": metadata.get("archived_at") or metadata.get("deleted_at"),
                     "video_url": None, "poster_url": None})
+        # Missing quality evidence remains unknown. Historical assessments can
+        # use the new display vocabulary while preserving their original method.
+        for episode in episodes:
+            episode["display_index"] = episode_state.get(episode.get("id"), {}).get("display_index")
+            quality = episode.setdefault("quality", {})
+            for stage in ("task", "reset"):
+                quality.setdefault(stage, {"label": "unknown", "assessments": 0,
+                    "uncertain_reports": 0, "missing_reports": 0, "failure_reports": []})
+                assessment = quality[stage]
+                label = assessment.get("label", "unknown")
+                outcome = episode.get("outcome" if stage == "task" else "reset_outcome")
+                # Historical reports keep their original evidence and counts.
+                # The display vocabulary changes; the measurement method does not.
+                assessment["classification"] = ("not_successful" if outcome and outcome != "success" else
+                    {"within_grasp_budget": "optimal", "extra_grasp_attempts": "suboptimal",
+                     "success_without_reported_failure": "optimal", "recovered_success": "suboptimal"}.get(label, "unknown")
+                    if outcome == "success" else "unknown")
+                assessment["classification_source"] = (
+                    "legacy_failure_assessment" if label in ("success_without_reported_failure", "recovered_success")
+                    else assessment.get("source", "unknown"))
         stats = empty_stats()
         visible = [episode for episode in episodes if not episode["archived"]]
         archived = [episode for episode in episodes if episode["archived"]]
@@ -435,6 +548,9 @@ class ProjectStore:
         stats["successes"] = sum(s.get("outcome") == "success" for s in visible)
         stats["reset_successes"] = sum(s.get("reset_outcome") == "success" for s in visible)
         stats["total_steps"] = sum(_number(s.get("steps")) + _number(s.get("reset_steps")) for s in visible)
+        # Usage follows the retained dataset (active + archived), not lifetime
+        # spend. Tombstones also exclude late receipts for deleted episodes.
+        usage_episode_ids = {episode["id"] for episode in episodes if not episode.get("delete_pending")}
         ledger = root / "api_calls.jsonl"
         if ledger.exists():
             seen = set()
@@ -447,6 +563,8 @@ class ProjectStore:
                         event = json.loads(line)
                     except ValueError:
                         continue  # A writer may currently be appending its last line.
+                    if event.get("episode_id") not in usage_episode_ids:
+                        continue
                     identity = event.get("attempt_id") or f"line-{index}"
                     if identity in seen:
                         continue
@@ -482,16 +600,12 @@ class ProjectStore:
                     for key in ("input_tokens", "output_tokens", "total_tokens", "api_requests",
                                 "estimated_cost_usd", "unknown_usage_requests"):
                         stats[key] += _number(stage.get(key))
-            for metadata in episode_state.values():
-                if metadata.get("deleted_at"):
-                    for key, value in metadata.get("retained_usage", {}).items():
-                        if key in stats:
-                            stats[key] += _number(value)
         return {"run_id": run_id, "created_at": manifest.get("created_at"),
                 "config": manifest.get("config", {}), "episodes": visible,
                 "archived_episodes": archived, "stats": stats}
 
     def details(self, project):
+        self.sync_episode_numbers()
         media = self.media_index()
         episode_state = self._load().get("episode_state", {})
         runs = []
@@ -507,6 +621,7 @@ class ProjectStore:
             for key in stats:
                 stats[key] += run["stats"][key]
         enriched = {**project, "stats": stats, "archived_count": len(archived),
-                    "usage_scope": "all_recorded_episodes", "thumbnail_url": next(
+                    "grasp_baseline": self.grasp_baseline(project),
+                    "usage_scope": "active_and_archived_episodes", "thumbnail_url": next(
             (s["poster_url"] for s in episodes if s.get("poster_url")), None)}
         return {"project": enriched, "runs": runs, "episodes": episodes, "archived_episodes": archived}

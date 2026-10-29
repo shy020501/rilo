@@ -1,17 +1,23 @@
 """Residual stop/resume/config integration with tiny temporary checkpoints only."""
 import asyncio
 from copy import deepcopy
+import shutil
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from rilo.config import Settings
+from rilo.contracts import ActionSpec
+from rilo.learning.checkpoints import fingerprint
 from rilo.learning.residual import TD3Config
 from rilo.learning.rl_train import ResidualTrainer
 from rilo.pipeline import PipelineEngine, PipelineStart, PipelineStopped
+from rilo.pipeline_plan import evaluation_signature
 from rilo.projects import ProjectCreate, ProjectStore
-from test_learning_runtime import SyntheticEpisode, controller
+from rilo.recording import Recorder
+from rilo.runner import StateConflict
+from test_learning_runtime import controller, observation
 
 
 @pytest.fixture(autouse=True)
@@ -51,6 +57,21 @@ def engine_fixture(tmp_path):
     settings = Settings(backend="demo", suite="demo", policy="scripted", data_dir=tmp_path / "runs")
     projects = ProjectStore(settings.data_dir)
     project = projects.create(ProjectCreate(name="Residual state fixture", backend="demo", suite="demo", task_id=0))
+    action_spec = ActionSpec(names=("dx",), low=(-1.,), high=(1.,), description="Fixture", control_hz=20)
+    recorder = Recorder(settings.data_dir, {"backend": "demo", "policy": "scripted"},
+                        {"action_spec": action_spec.to_dict()})
+    current = observation(0)
+    recorder.begin_episode(1, current, 0)
+    for index, action in enumerate((.1, .2, .3), start=1):
+        following = observation(index, index / 10, success=index == 3)
+        recorder.write({"kind": "transition", "stage": "task", "observation_id": current.id,
+                        "applied_action": [action], "next_observation": recorder.save_observation(following)})
+        current = following
+    recorder.write({"kind": "stage_end", "stage": "task", "outcome": "success"})
+    recorder.finish_episode({"id": "episode-0001", "index": 1, "outcome": "success",
+                             "reset_outcome": "success", "steps": 3})
+    recorder.close()
+    projects.link_run(project["id"], recorder.run_id)
     runner = QuietRunner()
     captured = []
     async def prepare(project_id, episodes, policy, metadata, budget):
@@ -59,18 +80,37 @@ def engine_fixture(tmp_path):
     engine = PipelineEngine(settings, projects, lambda: runner, prepare)
     config = TD3Config(hidden_dim=16, hidden_layers=1, num_critics=2, target_subset=2,
                        batch_size=4, learning_starts=1, buffer_capacity=16, critic_warmup_updates=0)
-    engine.configure(project["id"], {"device": "cpu", "rl_episodes_per_round": 1,
-                                      "residual": config.model_dump(mode="json")})
+    engine.configure(project["id"], {"device": "cpu", "rl_episodes_per_round": 1, "evaluation_episodes": 1,
+                                      "residual": config.model_dump(mode="json"),
+                                      "bc": base.model.config.model_dump(mode="json")})
     engine._state["status"].update(stage="rl", phase="running", job_id="synthetic-job")
-    engine._register("bc", "fixture-bc", {"checkpoint": str(tmp_path / "fixture-dp.pt"),
-                                          "config": {"image_size": 16}})
-    engine._register("progress", "fixture-progress", {"checkpoint": "unused-progress-fixture.pt"}, "fixture-bc")
+    snapshot = engine._snapshot(16)
+    model_id, folder = engine._artifact_folder("bc")
+    bc_path = folder / "fixture-dp.pt"
+    shutil.copyfile(tmp_path / "fixture-dp.pt", bc_path)
+    bc = engine._register("bc", model_id, {"checkpoint": str(bc_path), "checkpoint_sha256": fingerprint(bc_path),
+        "config": engine._state["config"]["bc"], "dataset": snapshot.successful().manifest()})
+    model_id, folder = engine._artifact_folder("progress")
+    progress_path = folder / "progress-fixture.pt"
+    progress_path.write_bytes(b"Progress predictor is mocked for residual state tests")
+    progress = engine._register("progress", model_id, {"checkpoint": str(progress_path),
+        "checkpoint_sha256": fingerprint(progress_path), "config": engine._state["config"]["progress"],
+        "dataset": snapshot.successful().manifest(), "provenance": {
+            "base_model_id": bc["id"], "base_checkpoint_sha256": bc["checkpoint_sha256"]}}, bc["id"])
+    # These tests enter the manual RL worker directly. Supply its established
+    # BC-evaluation prerequisite so they continue exercising residual Stop and
+    # replay persistence, rather than failing before the synthetic RL stage.
+    engine._state["evaluations"].append({"kind": "bc", "model_id": bc["id"],
+        "episodes": 1, "successes": 1, "success_rate": 100., "run_id": recorder.run_id,
+        "provenance": {"evaluation": evaluation_signature(project, engine._state["config"], "bc_eval"),
+                       "base_model_id": bc["id"], "base_checkpoint_sha256": bc["checkpoint_sha256"]}})
+    engine._save()
     trainer = ResidualTrainer(base.feature_dim, [-1.], [1.], config)
-    snapshot = SimpleNamespace(episodes=[SyntheticEpisode()], fingerprint="fixture-data")
     trainer.add_offline(snapshot, base)
     engine._trainer = trainer
+    engine._trainer_dataset = snapshot.manifest()
+    engine._active_bc, engine._active_progress = bc, progress
     engine._saved_rl_steps = 0
-    engine._snapshot = lambda image_size: snapshot
     return engine, trainer, runner, captured, base
 
 
@@ -141,13 +181,24 @@ async def test_stop_waits_for_inflight_update_before_partial_checkpoint(tmp_path
 
 
 @pytest.mark.parametrize("changed", [False, True])
-async def test_config_match_resumes_and_change_starts_fresh_preserving_previous_checkpoint(tmp_path, monkeypatch, changed):
+@pytest.mark.parametrize("partial", [False, True])
+async def test_config_match_resumes_and_change_starts_fresh_preserving_previous_checkpoint(tmp_path, monkeypatch, changed, partial):
     engine, trainer, runner, captured, base = engine_fixture(tmp_path)
     add_online(trainer)
-    await engine._save_residual({"fixture": True})
+    await engine._save_residual({"fixture": True, "partial": partial})
     previous = deepcopy(engine._latest(engine._state, "residual"))
     from pathlib import Path
     previous_bytes = Path(previous["checkpoint"]).read_bytes()
+    if partial:
+        plan = await engine._plan()
+        assert plan["models"]["residual"] is None
+        assert plan["models"]["residual_resume"]["id"] == previous["id"]
+        assert not plan["completion"]["stages"]["rl"]["complete"]
+        engine._trainer = None
+        monkeypatch.setattr("rilo.learning.progress.ProgressPredictor", lambda *args, **kwargs: SimpleNamespace())
+        with pytest.raises(StateConflict, match="Residual checkpoint is required"):
+            await engine._rollout_stage("rl_eval")
+        assert captured == []
     if changed:
         engine._state["config"]["residual"]["residual_scale"] = .2
     engine._trainer = None

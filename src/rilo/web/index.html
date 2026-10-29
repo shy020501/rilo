@@ -80,7 +80,7 @@
               <details class="run-options">
                 <summary>Reset &amp; cost limits</summary>
                 <div class="form-grid">
-                  <div><label for="reset-mode">After each task</label><select id="reset-mode" name="reset_mode"><option value="agent">GPT arm reset</option><option value="environment">Environment reset</option></select></div>
+                  <div><label for="reset-mode">After each task</label><select id="reset-mode" name="reset_mode"><option value="agent">GPT arm reset</option><option value="environment">Environment reset</option><option value="free_space">Restore, retreat, then simulator reset</option></select></div>
                   <div><label for="budget-usd">Run budget / USD</label><input id="budget-usd" name="budget_usd" type="number" value="15" min="0.01" max="1000" step="0.01" required></div>
                   <div><label for="max-reset-steps">Max reset steps</label><input id="max-reset-steps" name="max_reset_steps" type="number" value="300" min="1" max="10000" step="1" required></div>
                   <div><label for="max-reset-decisions">Max reset decisions</label><input id="max-reset-decisions" name="max_reset_decisions" type="number" value="40" min="1" max="1000" step="1" required></div>
@@ -93,12 +93,12 @@
             <div class="transport-grid">
               <button class="button primary" id="start-button" type="button" disabled><span aria-hidden="true">▶</span> <span id="start-label">Start run</span></button>
               <button class="button pause" id="pause-button" type="button" disabled><span aria-hidden="true">Ⅱ</span> Pause</button>
-              <button class="button secondary" id="step-button" type="button" disabled><span aria-hidden="true">▹│</span> One decision</button>
+              <button class="button secondary" id="step-button" type="button" disabled><span aria-hidden="true">▹│</span> Run once</button>
               <button class="button stop" id="stop-button" type="button" disabled><span aria-hidden="true">■</span> Stop run</button>
             </div>
             <button class="button text-button full-width" id="reset-button" type="button" disabled>Hard reset environment</button>
             <p class="control-message" id="control-message" role="status" aria-live="polite">Initialize the environment before starting.</p>
-            <p class="control-help">Pause applies during task execution and GPT reset. It stops after the current control tick; an in-progress environment reset must finish first. One decision runs one action chunk, then pauses. Hard reset discards the current scene.</p>
+            <p class="control-help">Pause applies during task execution and GPT reset. It stops after the current control tick; an in-progress environment reset must finish first. Run once completes exactly one episode and its reset, keeping the saved episode goal unchanged. Hard reset discards the current scene.</p>
           </section>
 
           <section class="panel session-panel">

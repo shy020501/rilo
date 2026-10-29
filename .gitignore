@@ -4,7 +4,7 @@
 !.env.example
 
 # Runtime data: runs, images, videos, project state, costs and model checkpoints
-artifacts/
+artifacts
 
 # Local environments and downloaded simulator assets
 .venv/
@@ -25,3 +25,4 @@ htmlcov/
 *.log
 playwright-report/
 test-results/
+tests/

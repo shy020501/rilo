@@ -40,7 +40,8 @@ def spec():
 
 def payload(**changes):
     value = {"observation_id": "episode-3:12", "status": "continue",
-             "actions": [{"values": [0.1, -1.0], "repeat": 2}], "note": "Approach the tray."}
+             "actions": [{"values": [0.1, -1.0], "repeat": 2}], "note": "Approach the tray.",
+             "next_reasoning_effort": None}
     value.update(changes)
     return value
 
@@ -310,7 +311,7 @@ async def test_prompt_override_is_hot_reloaded_but_inflight_snapshot_is_immutabl
     original_request = client.responses.create.call_args.kwargs
     assert "Use the first approach." in original_request["instructions"]
     assert "Use the revised approach." not in original_request["instructions"]
-    assert events[0]["prompt_template"] == module._INSTRUCTIONS + "\nOperator control guidance:\nUse the first approach."
+    assert events[0]["prompt_template"] == module._INSTRUCTIONS + module._FIXED_INSTRUCTIONS + "\nOperator control guidance:\nUse the first approach."
     assert events[0]["prompt_sha256"] == hashlib.sha256(events[0]["prompt_template"].encode()).hexdigest()
     client.responses.create.side_effect = None
     await policy.decide(observation, spec, {"stage": "reset"}, [])
@@ -337,3 +338,114 @@ def test_prompt_file_can_be_configured_with_environment(client, observation, spe
     path.write_text("Keep the reset path clear.", encoding="utf-8")
     monkeypatch.setenv("RILO_PROMPT_FILE", str(path))
     assert "Keep the reset path clear." in make_policy().build_request(observation, spec, {}, [])["instructions"]
+
+
+async def test_auto_escalates_without_motion_then_returns_to_medium(client, observation, spec):
+    events = []
+    policy = make_policy(reasoning_effort="auto", usage_callback=events.append)
+    client.responses.create.side_effect = [
+        response(json.dumps(payload(status="reconsider", actions=[], next_reasoning_effort="xhigh",
+            note="The next operation requires precise contact alignment."))),
+        response(json.dumps(payload(next_reasoning_effort="medium",
+            note="Measured contact is stable; the following motion has adequate clearance."))),
+        response(json.dumps(payload(next_reasoning_effort="medium"))),
+    ]
+    first = await policy.decide(observation, spec, {}, [])
+    assert first.status == "reconsider" and first.actions == []
+    assert first.reasoning_effort == "medium"
+    assert policy.current_reasoning_effort == "medium"  # Runner must first accept it.
+    policy.accept_decision(first)
+    assert policy.current_reasoning_effort == "xhigh"
+    second = await policy.decide(observation, spec, {}, [])
+    assert second.actions and second.reasoning_effort == "xhigh"
+    assert policy.current_reasoning_effort == "xhigh"
+    policy.accept_decision(second)
+    third = await policy.decide(observation, spec, {}, [])
+    assert third.reasoning_effort == "medium"
+    assert [call.kwargs["reasoning"]["effort"] for call in client.responses.create.call_args_list] == ["medium", "xhigh", "medium"]
+    assert [event["reasoning_effort"] for event in events] == ["medium", "xhigh", "medium"]
+    assert all(event["reasoning_mode"] == "auto" for event in events)
+    assert all(event["outcome"] == "accepted" for event in events)
+
+
+@pytest.mark.parametrize("effort,changes", [
+    ("auto", {"next_reasoning_effort": None}),
+    ("auto", {"next_reasoning_effort": "high"}),
+    ("auto", {"next_reasoning_effort": "xhigh"}),  # Must not move before escalation.
+    ("auto", {"status": "reconsider", "actions": [], "next_reasoning_effort": "medium"}),
+    ("auto", {"status": "reconsider", "next_reasoning_effort": "xhigh"}),
+    ("medium", {"status": "reconsider", "actions": [], "next_reasoning_effort": "xhigh"}),
+    ("medium", {"next_reasoning_effort": "medium"}),
+    ("medium", {"failure_assessment": {"result": "none", "evidence": ""}}),  # Removed protocol field.
+    ("medium", {"reasoning_effort": "xhigh"}),  # Actual effort is assigned locally.
+])
+async def test_invalid_adaptive_arguments_are_rejected(client, observation, spec, effort, changes):
+    policy = make_policy(reasoning_effort=effort)
+    client.responses.create.return_value = response(json.dumps(payload(**changes)))
+    with pytest.raises(PolicyError):
+        await policy.decide(observation, spec, {}, [])
+    assert policy.current_reasoning_effort == "medium"
+
+
+async def test_unaccepted_late_response_cannot_change_auto_effort(client, observation, spec):
+    started, release = asyncio.Event(), asyncio.Event()
+    events = []
+    async def late(**kwargs):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        return response(json.dumps(payload(status="reconsider", actions=[], next_reasoning_effort="xhigh")))
+    client.responses.create.side_effect = late
+    policy = make_policy(reasoning_effort="auto", usage_callback=events.append)
+    task = asyncio.create_task(policy.decide(observation, spec, {}, []))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    discarded = await task
+    assert discarded.next_reasoning_effort == "xhigh"
+    assert policy.current_reasoning_effort == "medium"
+    assert events[0]["reasoning_effort"] == "medium"
+    assert events[0]["next_reasoning_effort"] == "xhigh"
+
+
+async def test_auto_resets_at_episode_and_stage_boundaries(client, observation, spec):
+    policy = make_policy(reasoning_effort="auto")
+    client.responses.create.return_value = response(json.dumps(payload(status="reconsider", actions=[], next_reasoning_effort="xhigh")))
+    for reset in (lambda: policy.on_episode_start("episode-2"), lambda: policy.on_stage_start("reset")):
+        decision = await policy.decide(observation, spec, {}, [])
+        policy.accept_decision(decision)
+        assert policy.current_reasoning_effort == "xhigh"
+        reset()
+        assert policy.current_reasoning_effort == "medium"
+
+
+async def test_xhigh_cannot_request_another_reconsideration(client, observation, spec):
+    policy = make_policy(reasoning_effort="auto")
+    client.responses.create.return_value = response(json.dumps(payload(status="reconsider", actions=[], next_reasoning_effort="xhigh")))
+    policy.accept_decision(await policy.decide(observation, spec, {}, []))
+    with pytest.raises(PolicyError, match="medium-to-xhigh"):
+        await policy.decide(observation, spec, {}, [])
+
+
+def test_adaptive_prompt_is_task_independent_without_per_decision_classification(client, observation, spec):
+    policy = make_policy(reasoning_effort="auto")
+    request = policy.build_request(observation, spec, {}, [])
+    prompt = policy._prompt_template()
+    assert "precision" in prompt and "stable" in prompt and "uncertain" in prompt
+    assert "failure_assessment" not in str(request)
+    assert "hidden chain-of-thought" in prompt
+    assert observation.task not in prompt
+    assert "drawer" not in prompt and "handle" not in prompt
+    assert request["reasoning"]["effort"] == "medium"
+    assert '"current_reasoning_effort": "medium"' in request["input"][0]["content"][0]["text"]
+
+
+def test_removed_classification_is_not_reintroduced_by_old_receipt_history(client, observation, spec):
+    history = [{"executed_steps": 1, "note": "Motion receipt", "failure_assessment": {"result": "failure", "evidence": "Old label"}}]
+    request = make_policy().build_request(observation, spec, {}, history)
+    assert "failure_assessment" not in str(request) and "Old label" not in str(request)
+    assert '"executed_steps": 1' in request["input"][0]["content"][0]["text"]
+    assert history[0]["failure_assessment"]["result"] == "failure"

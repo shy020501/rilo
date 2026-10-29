@@ -37,6 +37,7 @@ class DPConfig(BaseModel):
     backbone: Literal["resnet18", "tiny"] = "resnet18"
     imagenet_init: bool = True
     steps: int = Field(default=10000, ge=1, le=1000000)
+    checkpoint_every: int = Field(default=1000, ge=1, le=1000000)
     batch_size: int = Field(default=32, ge=1, le=1024)
     learning_rate: float = Field(default=1e-4, gt=0, le=.1)
     encoder_learning_rate: float = Field(default=1e-5, gt=0, le=.1)

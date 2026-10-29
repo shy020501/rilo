@@ -55,6 +55,18 @@ class Recorder:
         if self.episode_path and self.episode_path.name == episode_id:
             self.close()
 
+    def update_prepared_config(self, changes: dict):
+        """Update an unstarted run's manifest and retain the setup-change receipt."""
+        path = self.path / "manifest.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        previous = {key: manifest["config"].get(key) for key in changes}
+        manifest["config"].update(changes)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(dump_json(manifest), encoding="utf-8")
+        temporary.replace(path)
+        self.write({"kind": "control", "event": "prepared_config_updated",
+                    "previous": previous, "changes": changes})
+
     def begin_episode(self, index: int, observation: Observation, seed: int, *, start_kind: str = "environment_reset"):
         self.episode_path = self.path / f"episode-{index:04d}"
         self.episode_path.mkdir()

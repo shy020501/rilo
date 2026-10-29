@@ -1,6 +1,9 @@
 {
+  "bc_algorithm": "dp",
+  "rl_algorithm": "residual_td3",
   "collection_episodes": 20,
   "evaluation_episodes": 10,
+  "evaluation_reset_mode": "inherit",
   "bc_success_target": 70.0,
   "rl_success_target": 90.0,
   "max_bc_cycles": 10,
@@ -9,7 +12,7 @@
   "progress_gate_threshold": 0.8,
   "gpt_judge_interval": 20,
   "run_budget_usd": 15.0,
-  "device": "auto",
+  "device": "cuda:0",
   "bc": {
     "image_size": 128,
     "obs_steps": 2,
@@ -27,6 +30,7 @@
     "backbone": "resnet18",
     "imagenet_init": true,
     "steps": 10000,
+    "checkpoint_every": 1000,
     "batch_size": 32,
     "learning_rate": 0.0001,
     "encoder_learning_rate": 1e-05,
@@ -38,7 +42,7 @@
     "patience": 8,
     "min_steps": 500,
     "seed": 0,
-    "device": "auto",
+    "device": "cuda:0",
     "successful_only": true
   },
   "progress": {
@@ -52,7 +56,7 @@
     "eval_every": 100,
     "patience": 10,
     "seed": 0,
-    "device": "auto"
+    "device": "cuda:0"
   },
   "residual": {
     "hidden_dim": 256,

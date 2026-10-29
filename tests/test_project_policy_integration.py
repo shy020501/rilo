@@ -42,7 +42,8 @@ def test_project_policy_snapshot_and_real_factory_selection(tmp_path, monkeypatc
         assert unchanged["observation"]["id"] == observation_id
         assert {k: unchanged[k] for k in selected} == selected
         assert not constructed
-        assert client.post(url + "/step", json={}).status_code == 200
+        assert client.post(url + "/start", json={}).status_code == 200
+        assert client.post(url + "/pause", json={}).status_code == 200
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline:
             status = client.get("/api/status").json()
@@ -59,7 +60,7 @@ def test_project_policy_snapshot_and_real_factory_selection(tmp_path, monkeypatc
         next_run = client.post(url + "/initialize", json={}).json()
         assert next_run["run_id"] != run_id
         assert {k: next_run[k] for k in following} == following
-        assert client.post(url + "/step", json={}).status_code == 200
+        assert client.post(url + "/start", json={}).status_code == 200
         assert constructed[-1] == ("gpt-6-astra", "high")
 
 

@@ -70,11 +70,13 @@ class ActionCommand(BaseModel):
 class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid")
     observation_id: str
-    status: Literal["continue", "success", "failure", "help"]
+    status: Literal["continue", "success", "failure", "help", "reconsider"]
     actions: list[ActionCommand] = Field(default_factory=list, max_length=8)
     note: str = Field(default="", max_length=2000)
     usage: dict[str, int] = Field(default_factory=dict)
     response_id: str | None = None
+    next_reasoning_effort: Literal["medium", "xhigh"] | None = None
+    reasoning_effort: str | None = None
 
 
 class EnvironmentAdapter(Protocol):

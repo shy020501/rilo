@@ -31,6 +31,11 @@ RESET_DRAWER_TASKS = {
     "KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet": "top",
     "KITCHEN_SCENE2_open_the_top_drawer_of_the_cabinet": "top",
 }
+FREE_SPACE_RADIUS_M = 0.20
+FREE_SPACE_ENV_CLEARANCE_M = 0.02
+FREE_SPACE_SELF_CLEARANCE_M = 0.005
+FREE_SPACE_JOINT_SPEED_RAD_S = 0.05
+FREE_SPACE_GRIPPER_SPEED_M_S = 0.01
 
 
 def prepare_libero_config(config_dir: Path | None = None) -> Path:
@@ -112,7 +117,10 @@ class LiberoAdapter:
         self._init_state_id: int | None = None
         self._terminal = False
         self._stage = "task"
+        self._reset_mode = "agent"
         self._reset_reference: dict[str, Any] | None = None
+        self._free_space_pairs: dict[str, list[tuple[int, int]]] | None = None
+        self._initial_gripper_open: bool | None = None
         self._spec = ActionSpec(
             names=("dx", "dy", "dz", "drx", "dry", "drz", "gripper"),
             low=(-1.0,) * 7, high=(1.0,) * 7, control_hz=float(control_hz),
@@ -173,6 +181,8 @@ class LiberoAdapter:
             "controller": "OSC_POSE", "simulation": True,
             "camera_names": list(CAMERAS), "image_size": self.image_size,
             "action_spec": self._spec.to_dict(),
+            "gripper_control": {"action_index": 6, "close_sign": 1, "deadband": 0.1,
+                                "initial_open": self._initial_gripper_open},
             "observation_notes": (
                 "Images are upright RGB. EEF position is in the simulation world frame; "
                 "all quaternions are xyzw. robot0_eef_pos is the gripper grip-site position; "
@@ -194,6 +204,27 @@ class LiberoAdapter:
             "supported": self._reset_reference is not None,
             "stage": self._stage,
         }
+        free_reference = (self._reset_reference or {}).get("free_space", {})
+        result["free_space_reset"] = {
+            "supported": bool(free_reference.get("verified")),
+            "simulation_only": True,
+            "reason": free_reference.get("reason", "This task has no verified free-space reset reference."),
+            "position_radius_m": FREE_SPACE_RADIUS_M,
+            "environment_clearance_m": FREE_SPACE_ENV_CLEARANCE_M,
+            "self_clearance_m": FREE_SPACE_SELF_CLEARANCE_M,
+            "max_joint_speed_rad_s": FREE_SPACE_JOINT_SPEED_RAD_S,
+            "max_gripper_speed_m_s": FREE_SPACE_GRIPPER_SPEED_M_S,
+            "verification": (
+                "Restore all drawers and preserve other objects, open the gripper, and stop "
+                "within the reference EEF region. Check collision-geometry distance for all "
+                "moving robot links against environment geometry and nonadjacent robot links. "
+                "Fixed mounting geometry and same/adjacent welded-link articulation pairs "
+                "are excluded. This certifies only the current simulation endpoint, not the "
+                "swept path or real-hardware return safety. No initial orientation match is required."
+            ),
+        }
+        if self._reset_reference is not None:
+            result["free_space_reset"]["target_position_m"] = self._reset_reference["robot"]["robot0_eef_pos"]
         if self._reset_reference is not None:
             result["agent_reset"].update({
                 "drawer_level": self._reset_reference["drawer_level"],
@@ -330,7 +361,9 @@ class LiberoAdapter:
         self._observation_sequence = 0
         self._terminal = False
         self._stage = "task"
+        self._reset_mode = "agent"
         self._reset_reference = None
+        self._free_space_pairs = None
         # Settling is part of reset, never attributed to GPT's trajectory.
         settled = 0
         for _ in range(self.settle_steps):
@@ -338,6 +371,7 @@ class LiberoAdapter:
             settled += 1
             if done:
                 break
+        self._initial_gripper_open = self._gripper_is_open(raw)
         self._capture_reset_reference(raw)
         return self._observation(raw, {"reset_settle_steps": settled})
 
@@ -371,9 +405,164 @@ class LiberoAdapter:
                 raw["agentview_image"][::-1] if self._flip_images else raw["agentview_image"],
                 dtype=np.uint8).copy(),
         }
+        self._capture_free_space_reference(raw)
+
+    @staticmethod
+    def _gripper_is_open(raw: dict[str, Any]) -> bool:
+        grip = np.asarray(raw.get("robot0_gripper_qpos", []), dtype=float)
+        return bool(grip.shape == (2,) and np.all(np.isfinite(grip)) and np.sum(np.abs(grip)) >= 0.06)
+
+    def _capture_free_space_reference(self, raw: dict[str, Any]) -> None:
+        reference = self._reset_reference
+        reference["free_space"] = {"verified": False, "reason": "Initial clearance or velocity could not be verified."}
+        self._free_space_pairs = None
+        try:
+            base = getattr(self._env, "env", self._env)
+            if not hasattr(base, "objects_dict") or not hasattr(base, "obj_body_id"):
+                raise ValueError("Missing scene-object inventory for independent restoration checks")
+            self._free_space_pairs = self._collision_pairs()
+            clearance = self._free_space_clearance()
+            verified = (all(clearance.values()) and self._robot_is_stationary(raw)
+                        and self._gripper_is_open(raw))
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError):
+            return
+        reference["free_space"] = {"verified": bool(verified), "reason": (
+            "Initial simulation endpoint independently verified." if verified else
+            "Initial clearance, open gripper or low velocity did not meet the verifier limits.")}
+
+    def _collision_pairs(self) -> dict[str, list[tuple[int, int]]]:
+        """Model-owned collision bodies; never infer ownership from GPT output."""
+        model = self._env.sim.model
+        robots = self._env.robots
+        if len(robots) != 1:
+            raise ValueError("Free-space verification requires one known robot")
+        root = int(model.body_name2id(robots[0].robot_model.root_body))
+        parents = np.asarray(model.body_parentid, dtype=int)
+        welds = np.asarray(model.body_weldid, dtype=int)
+        bodies = np.asarray(model.geom_bodyid, dtype=int)
+        types = np.asarray(model.geom_type, dtype=int)
+        contact = (np.asarray(model.geom_contype) != 0) | (np.asarray(model.geom_conaffinity) != 0)
+        if root <= 0 or root >= len(parents) or len(welds) != len(parents):
+            raise ValueError("Invalid robot topology")
+        if not (len(bodies) == len(types) == len(contact) == int(model.ngeom)):
+            raise ValueError("Incomplete collision geometry")
+        if (np.any(parents < 0) or np.any(parents >= len(parents)) or
+                np.any(welds < 0) or np.any(welds >= len(parents)) or
+                np.any(bodies < 0) or np.any(bodies >= len(parents))):
+            raise ValueError("Invalid collision body indices")
+
+        def is_robot(body):
+            seen = set()
+            while body:
+                if body == root:
+                    return True
+                if body in seen:
+                    raise ValueError("Cyclic body topology")
+                seen.add(body)
+                body = int(parents[body])
+            return False
+
+        robot_bodies = {body for body in range(len(parents)) if is_robot(body)}
+        robot = [i for i in range(len(bodies)) if contact[i] and bodies[i] in robot_bodies]
+        moving = [i for i in robot if welds[bodies[i]] != welds[root]]
+        environment = [i for i in range(len(bodies)) if contact[i] and bodies[i] not in robot_bodies]
+        if not moving or not environment:
+            raise ValueError("Missing robot or environment collision geometry")
+        # MuJoCo 3.2 enum: plane, sphere, capsule, ellipsoid, cylinder, box, mesh.
+        # Heightfields and signed-distance fields require a separately verified path.
+        if (any(types[i] not in (0, 2, 3, 4, 5, 6, 7) for i in robot + environment)
+                or any(types[i] == 0 for i in robot)):
+            raise ValueError("Unsupported collision geometry type")
+        pairs = {"environment_clear": [(a, b) for a in moving for b in environment], "robot_self_clear": []}
+        for i, first in enumerate(robot):
+            for second in robot[i + 1:]:
+                if first not in moving and second not in moving:
+                    continue
+                a, b = int(welds[bodies[first]]), int(welds[bodies[second]])
+                # Native MuJoCo excludes same/adjacent welded links: touching
+                # articulation housings are not a free-space collision failure.
+                if a == b or welds[parents[a]] == b or welds[parents[b]] == a:
+                    continue
+                pairs["robot_self_clear"].append((first, second))
+        return pairs
+
+    def _geom_distance(self, first: int, second: int, limit: float) -> float:
+        import mujoco
+        sim = self._env.sim
+        return float(mujoco.mj_geomDistance(sim.model._model, sim.data._data,
+                                           first, second, limit, None))
+
+    def _free_space_clearance(self) -> dict[str, bool]:
+        checks = {"environment_clear": False, "robot_self_clear": False}
+        if self._free_space_pairs is None:
+            return checks
+        try:
+            model, data = self._env.sim.model, self._env.sim.data
+            positions = np.asarray(data.geom_xpos, dtype=float)
+            rotations = np.asarray(data.geom_xmat, dtype=float)
+            radii = np.asarray(model.geom_rbound, dtype=float)
+            types = np.asarray(model.geom_type, dtype=int)
+            if (positions.shape != (model.ngeom, 3) or rotations.shape not in ((model.ngeom, 9), (model.ngeom, 3, 3))
+                    or radii.shape != (model.ngeom,) or np.any(radii < 0)
+                    or not all(np.all(np.isfinite(x)) for x in (positions, rotations, radii))):
+                return checks
+            for key, pairs in self._free_space_pairs.items():
+                margin = FREE_SPACE_ENV_CLEARANCE_M if key == "environment_clear" else FREE_SPACE_SELF_CLEARANCE_M
+                clear = True
+                for first, second in pairs:
+                    # Bounding spheres provide a conservative broad phase only;
+                    # planes have unbounded extent and always use exact distance.
+                    if types[first] != 0 and types[second] != 0 and (
+                            np.linalg.norm(positions[first] - positions[second]) > radii[first] + radii[second] + margin):
+                        continue
+                    distance = self._geom_distance(first, second, margin * 2)
+                    if not np.isfinite(distance) or distance < margin:
+                        clear = False
+                        break
+                checks[key] = clear
+        except (AttributeError, IndexError, TypeError, ValueError, RuntimeError, ImportError):
+            return {"environment_clear": False, "robot_self_clear": False}
+        return checks
+
+    @staticmethod
+    def _robot_is_stationary(raw: dict[str, Any]) -> bool:
+        arm = np.asarray(raw.get("robot0_joint_vel", []), dtype=float)
+        grip = np.asarray(raw.get("robot0_gripper_qvel", []), dtype=float)
+        return bool(arm.shape == (7,) and grip.shape == (2,) and
+                    np.all(np.isfinite(arm)) and np.all(np.isfinite(grip)) and
+                    np.max(np.abs(arm)) <= FREE_SPACE_JOINT_SPEED_RAD_S and
+                    np.max(np.abs(grip)) <= FREE_SPACE_GRIPPER_SPEED_M_S)
+
+    def _free_space_reset_checks(self, raw: dict[str, Any]) -> dict[str, bool]:
+        full = self._reset_checks(raw)
+        reference = self._reset_reference or {}
+        target = reference.get("robot", {}).get("robot0_eef_pos", [])
+        position = np.asarray(raw.get("robot0_eef_pos", []), dtype=float)
+        return {
+            "reference_verified": bool(reference.get("free_space", {}).get("verified")),
+            "drawers_restored": full.get("drawers_restored", False),
+            "other_objects_preserved": full.get("other_objects_preserved", False),
+            "gripper_open": self._gripper_is_open(raw) and full.get("gripper_open", False),
+            "robot_in_retreat_region": bool(position.shape == (3,) and np.all(np.isfinite(position))
+                and len(target) == 3 and np.linalg.norm(position - target) <= FREE_SPACE_RADIUS_M),
+            "robot_stationary": self._robot_is_stationary(raw),
+            **self._free_space_clearance(),
+        }
 
     def _reset_instruction(self) -> str:
         level = self._reset_reference["drawer_level"] if self._reset_reference is not None else "middle"
+        if self._reset_mode == "free_space":
+            return (
+                f"Restore this scene after the {level}-drawer task. Physically close all drawers "
+                "and restore any displaced tabletop objects using the saved initial scene image. "
+                "Release the handle and open the gripper fully. Retreat through a visibly clear "
+                "path into environment.free_space_reset.target_position_m's documented region. "
+                "You do not need to reproduce the initial EEF orientation. Keep every moving "
+                "robot link clear of objects and stop motion; use short actions and inspect the "
+                "independent reset_checks. A simulator return is permitted only after the "
+                "independent endpoint verifier succeeds; your success claim cannot authorize it. "
+                "Endpoint clearance does not establish that the preceding path was collision-free."
+            )
         return (
             f"Restore this scene for another {level}-drawer opening demonstration. "
             f"Physically push the {level} drawer fully closed; leave the other drawers "
@@ -432,10 +621,20 @@ class LiberoAdapter:
 
     def begin_reset(self) -> Observation:
         """Switch to a physical reset objective without changing the world."""
+        self._reset_mode = "agent"
+        return self._begin_stage("reset")
+
+    def begin_free_space_reset(self) -> Observation:
+        """Simulation-only release/retreat, verified without exact pose matching."""
+        if not (self._reset_reference or {}).get("free_space", {}).get("verified"):
+            raise RuntimeError("Free-space reset is not supported: no independently verified reference")
+        self._reset_mode = "free_space"
         return self._begin_stage("reset")
 
     def begin_task(self) -> Observation:
         """Start the next task from the independently verified restored world."""
+        if self._reset_mode == "free_space":
+            raise RuntimeError("Free-space reset requires the verified simulator return before another task")
         if self._stage != "reset":
             raise RuntimeError("The next task requires a completed physical reset")
         observation = self.observe()
@@ -481,7 +680,8 @@ class LiberoAdapter:
         if self._stage == "reset" and self._reset_reference is not None:
             images["reset_reference_agentview"] = self._reset_reference["agentview"].copy()
         task_success = bool(self._env.check_success())
-        reset_checks = self._reset_checks(raw)
+        reset_checks = (self._free_space_reset_checks(raw) if self._reset_mode == "free_space"
+                        else self._reset_checks(raw))
         reset_success = bool(reset_checks) and all(reset_checks.values())
         success = reset_success if self._stage == "reset" else task_success
         # LIBERO's BDDL step overrides ``done`` with its original task predicate
@@ -541,4 +741,6 @@ class LiberoAdapter:
             environment, self._env = self._env, None
             self._episode_id = ""
             self._reset_reference = None
+            self._free_space_pairs = None
+            self._initial_gripper_open = None
             environment.close()

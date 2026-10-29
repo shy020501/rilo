@@ -19,6 +19,7 @@ from rilo.config import Settings, make_adapter, make_policy
 from rilo.contracts import Decision, EnvironmentAdapter, Observation, Policy
 from rilo.recording import Recorder, dump_json
 from rilo.policy_settings import PolicyConfig
+from rilo.grasp_count import GraspCounter
 
 
 class RunConfig(BaseModel):
@@ -28,7 +29,7 @@ class RunConfig(BaseModel):
     max_steps: int = Field(default=300, ge=1, le=10000)
     max_decisions: int = Field(default=50, ge=1, le=10000)
     episodes: int = Field(default=1, ge=1, le=100)
-    reset_mode: Literal["agent", "environment"] = "agent"
+    reset_mode: Literal["agent", "environment", "free_space"] = "agent"
     max_reset_steps: int = Field(default=300, ge=1, le=10000)
     max_reset_decisions: int = Field(default=40, ge=1, le=1000)
     budget_usd: float = Field(default=15, gt=0, le=1000, allow_inf_nan=False)
@@ -61,6 +62,7 @@ class Runner:
         self._epoch = 0
         self._stopping = False
         self._single = False
+        self._run_started = False
         self._task: asyncio.Task | None = None
         self._inference: asyncio.Task | None = None
         self._decision_interrupt: asyncio.Event | None = None
@@ -83,6 +85,13 @@ class Runner:
         self.recorder: Recorder | None = None
         self._run_policy_override = False
         self._recording_metadata: dict = {}
+        self.environment_connected = False
+        self._scene_ready = False
+        self._scene_seed = None
+        self._grasp_baseline = None
+        self._baseline_provider = self._baseline_save = None
+        self._baseline_resolved = True
+        self._grasp_counter = GraspCounter(None)
 
     async def _env(self, method, *args, **kwargs):
         # MuJoCo's rendering context is thread-affine. Never use asyncio.to_thread
@@ -150,12 +159,64 @@ class Runner:
                 return [{"id": 0, "name": "default", "language": "Default environment task"}]
             return await self._env(method)
 
+    @property
+    def can_start_new_run(self):
+        return bool(self.environment_connected and self.phase in ("connected", "ready", "paused", "completed", "stopped")
+            and (not self._run_started or self.phase in ("completed", "stopped"))
+            and (self._scene_ready or (self.config.reset_mode != "free_space" and self.stage == "reset" and self.observation and self.observation.success)
+                 or (self.phase == "completed" and self.config.reset_mode == "environment"
+                     and self.context.get("simulation") is True)))
+
+    async def connect_environment(self, *, task_id: int, seed: int = 0):
+        """Connect/preview a scene without creating a run or selecting a policy."""
+        async with self._control_lock:
+            if self.phase in ("thinking", "executing", "initializing", "pausing", "paused") and self._run_started:
+                raise StateConflict("Stop the current run before reconnecting the environment.")
+            await self._stop_locked("reconnected")
+            self.recorder = None
+            self.episode = {}
+            self._release_policy()
+            self.phase = "initializing"
+            self.environment_connected = self._scene_ready = False
+            try:
+                await self._ensure_adapter()
+                context = await self._env(self.adapter.describe)
+                if context.get("simulation") is True:
+                    obs = await self._env(self.adapter.reset, seed=seed, task_id=task_id)
+                elif callable(getattr(self.adapter, "connect", None)):
+                    obs = await self._env(self.adapter.connect, task_id=task_id)
+                else:
+                    # Hardware adapters must never be reset merely to connect.
+                    obs = await self._env(self.adapter.observe)
+                self.config = RunConfig(task_id=task_id, seed=seed)
+                self._scene_seed = seed
+                self.context = await self._env(self.adapter.describe)
+                self.context["action_spec"] = self.adapter.action_spec.to_dict()
+                self._capture(obs)
+                self.stats = _stats()
+                self.history.clear()
+                self.latest_decision = self.latest_receipt = None
+                self._run_started = False
+                self.stage, self.phase, self.error = "task", "connected", None
+                self.environment_connected = self._scene_ready = True
+                self._event("ready", "Environment connected. Run settings will be selected when collection starts.")
+            except Exception as exc:
+                self.phase, self.error = "error", self._safe_error(exc)
+                raise
+
     async def initialize(self, config: RunConfig, *, preserve_environment: bool = False,
                          policy_config: PolicyConfig | None = None, policy_override: Policy | None = None,
-                         recording_metadata: dict | None = None):
+                         recording_metadata: dict | None = None, from_connected: bool = False):
         async with self._control_lock:
             selected = (replace(self.settings, **PolicyConfig.model_validate(policy_config).model_dump())
                         if policy_config is not None else self.settings)
+            if from_connected and not self.can_start_new_run:
+                raise StateConflict("Finish recovery or explicitly reconnect before starting a new run.")
+            if from_connected and config.task_id != self.config.task_id:
+                raise StateConflict("Connect the selected task before starting a run.")
+            seed_changed = from_connected and config.seed != self._scene_seed
+            continue_reset = from_connected and self.stage == "reset" and not self._scene_ready and not seed_changed
+            reset_for_new_run = from_connected and self.phase == "completed" and self.config.reset_mode == "environment"
             if preserve_environment and not (self.stage == "reset" and self.observation and self.observation.success
                     and self.phase in ("completed", "paused") and config.task_id == self.config.task_id
                     and config.seed == self.config.seed):
@@ -173,20 +234,40 @@ class Runner:
             self.phase = "initializing"
             self.error = None
             self.config = config
+            self._run_started = False
             self._stopping = False
             self._permit.clear()
             self.history.clear()
             self.latest_decision = self.latest_receipt = None
             self.stats = _stats()
+            self._grasp_baseline = None
+            self._baseline_provider = self._baseline_save = None
+            self._baseline_resolved = True
             try:
                 await self._ensure_adapter()
-                obs = await self._env(self.adapter.begin_task) if preserve_environment else await self._env(self.adapter.reset, seed=config.seed, task_id=config.task_id)
+                if preserve_environment or continue_reset:
+                    obs = await self._env(self.adapter.begin_task)
+                elif from_connected:
+                    if (seed_changed or reset_for_new_run) and self.context.get("simulation") is True:
+                        obs = await self._env(self.adapter.reset, seed=config.seed, task_id=config.task_id)
+                        self._scene_seed = config.seed
+                    else:
+                        obs = await self._env(self.adapter.observe)
+                else:
+                    obs = await self._env(self.adapter.reset, seed=config.seed, task_id=config.task_id)
+                    self._scene_seed = config.seed
                 self.context = await self._env(self.adapter.describe)
                 self.context["action_spec"] = self.adapter.action_spec.to_dict()
                 if config.reset_mode == "agent" and not all(callable(getattr(self.adapter, name, None)) for name in ("begin_reset", "begin_task")):
                     raise ValueError("This adapter does not implement GPT reset. Choose an adapter with begin_reset/begin_task support.")
                 if config.reset_mode == "agent" and self.context.get("agent_reset", {}).get("supported") is False:
                     raise ValueError("This task has no independent GPT reset verifier. Select a supported reversible task (LIBERO-90 task 7 or LIBERO goal task 0).")
+                if config.reset_mode == "free_space" and not (
+                        self.context.get("simulation") is True
+                        and self.context.get("free_space_reset", {}).get("supported") is True
+                        and callable(getattr(self.adapter, "begin_free_space_reset", None))):
+                    raise ValueError("Free-space reset requires a simulator with an independent restoration and clearance verifier.")
+                self.environment_connected = self._scene_ready = True
                 self.recorder = Recorder(self.settings.data_dir, {
                     **config.model_dump(), "backend": self.settings.backend,
                     "suite": self.settings.suite, "policy": self.settings.policy,
@@ -195,9 +276,9 @@ class Runner:
                     "source_sha256": self._source_hash(),
                     "learning": self._recording_metadata,
                 }, self.context)
-                self._begin_episode(obs, 1, start_kind="agent_reset_continuation" if preserve_environment else "environment_reset")
+                self._begin_episode(obs, 1, start_kind="agent_reset_continuation" if preserve_environment or continue_reset else "connected_scene" if from_connected else "environment_reset")
                 self.phase = "ready"
-                self._event("ready", "Environment initialized. Inspect the cameras, then start or run one decision.")
+                self._event("ready", "Run prepared. Collection uses the settings selected for this run.")
             except Exception as exc:
                 self.phase, self.error = "error", self._safe_error(exc)
                 self._event("error", self.error)
@@ -213,8 +294,12 @@ class Runner:
                         "stage_steps": 0, "stage_decisions": 0,
                         "reset_steps": 0, "reset_decisions": 0, "reset_outcome": None,
                         "costs": {"task": _stats(), "reset": _stats()},
-                        "started_at": time.time()}
-        episode_seed = self.config.seed if self.config.reset_mode == "agent" else self.config.seed + index - 1
+                        "started_at": time.time(),
+                        "quality": {}}
+        self._grasp_counter = GraspCounter(self.context.get("gripper_control"))
+        for stage in ("task", "reset"):
+            self.episode["quality"][stage] = self._grasp_counter.quality(stage, None, self._grasp_baseline)
+        episode_seed = self._scene_seed if self._scene_seed is not None else self.config.seed
         self.recorder.begin_episode(index, obs, episode_seed,
                                     start_kind=start_kind or ("agent_reset_continuation" if index > 1 and self.config.reset_mode == "agent" else "environment_reset"))
         if self.policy is not None and hasattr(self.policy, "on_episode_start"):
@@ -234,10 +319,36 @@ class Runner:
 
     def _batch_done(self):
         return self._cycle_done() and (self.episode["index"] >= self.config.episodes or
-            (self.config.reset_mode == "agent" and self.episode.get("reset_outcome") != "success"))
+            (self.config.reset_mode != "environment" and self.episode.get("reset_outcome") != "success")) and not (
+                self.config.reset_mode == "free_space" and self.episode.get("reset_outcome") == "success"
+                and not self.episode.get("environment_reset_done"))
 
     def _budget_limits(self):
         return (self.config.max_reset_steps, self.config.max_reset_decisions) if self.stage == "reset" else (self.config.max_steps, self.config.max_decisions)
+
+    async def update_prepared_episode_goal(self, episodes: int) -> bool:
+        """A started run keeps its goal, including across Pause/Resume."""
+        async with self._control_lock:
+            if (self._run_started or self.phase not in ("ready", "paused") or
+                    self.recorder is None or self._recording_metadata.get("pipeline_stage")):
+                return False
+            config = RunConfig.model_validate({**self.config.model_dump(), "episodes": episodes})
+            if config.episodes != self.config.episodes:
+                self.recorder.update_prepared_config({"episodes": config.episodes})
+                self.config = config
+                self._event("control", f"Prepared episode goal updated to {episodes}.")
+                self._write_summary()
+            return True
+
+    def _finish_quality(self, stage: str, outcome: str):
+        self.episode["quality"][stage] = self._grasp_counter.quality(stage, outcome, self._grasp_baseline)
+
+    def configure_grasp_baseline(self, baseline, *, provider=None, save=None):
+        self._grasp_baseline = dict(baseline) if baseline is not None else None
+        self._baseline_provider, self._baseline_save = provider, save
+        self._baseline_resolved = baseline is not None or provider is None
+        if baseline is not None and self.recorder:
+            self.recorder.update_prepared_config({"grasp_baseline": self._grasp_baseline})
 
     def _usage_callback(self):
         recorder, stats, episode, stage = self.recorder, self.stats, self.episode, self.stage
@@ -260,6 +371,7 @@ class Runner:
         if self.recorder:
             self.recorder.write_summary({"run_id": self.recorder.run_id, "phase": self.phase,
                 "stage": self.stage, "stats": dict(self.stats), "episode": dict(self.episode),
+                "config": self.config.model_dump(), "run_started": self._run_started,
                 "source_sha256": self._source_hash(), "updated_at": time.time()})
 
     async def start(self, *, single: bool = False):
@@ -269,6 +381,11 @@ class Runner:
                 raise StateConflict("Initialize a new episode before starting; only ready/paused episodes can run.")
             if self.policy is None:
                 self.policy = self._policy_factory() if self._policy_factory else make_policy(self._policy_settings)
+                if hasattr(self.policy, "on_episode_start"):
+                    self.policy.on_episode_start(self.episode["id"])
+                if self.stage != "task" and hasattr(self.policy, "on_stage_start"):
+                    self.policy.on_stage_start(self.stage)
+            self._run_started = True
             self._single, self._stopping = single, False
             self._epoch += 1
             self.phase = "ready"
@@ -340,8 +457,11 @@ class Runner:
         """
         if hasattr(self.policy, "usage_callback"):
             self.policy.usage_callback = self._usage_callback()
-        request = asyncio.create_task(self.policy.decide(
+        return await self._await_policy_request(self.policy.decide(
             before, self.adapter.action_spec, self.context, list(self.history)))
+
+    async def _await_policy_request(self, operation):
+        request = asyncio.create_task(operation)
         signal = asyncio.Event()
         self._inference, self._decision_interrupt = request, signal
         interrupted = asyncio.create_task(signal.wait())
@@ -374,10 +494,11 @@ class Runner:
         """Switch objectives without physics reset in agent mode, including final reset."""
         if not self.episode.get("outcome"):
             return True
-        if self.config.reset_mode == "agent" and not self.episode.get("reset_outcome"):
+        if self.config.reset_mode in ("agent", "free_space") and not self.episode.get("reset_outcome"):
             if self.stage != "reset":
                 self.phase = "initializing"
-                obs = await self._env(self.adapter.begin_reset)
+                method = self.adapter.begin_free_space_reset if self.config.reset_mode == "free_space" else self.adapter.begin_reset
+                obs = await self._env(method)
                 self.stage = "reset"
                 if self.policy is not None and hasattr(self.policy, "on_stage_start"):
                     self.policy.on_stage_start("reset")
@@ -389,6 +510,33 @@ class Runner:
                 self.recorder.write({"kind": "stage_start", "stage": "reset", "observation": self.recorder.save_observation(obs)})
                 self._event("reset", "GPT reset started. Physics state is preserved; no environment reset.")
             return True
+        if (self.config.reset_mode == "free_space" and self.episode.get("reset_outcome") == "success"
+                and not self.episode.get("environment_reset_done")):
+            # A final episode also completes the verified handoff. Never invoke
+            # reset for an unverified endpoint or a physical robot.
+            if not self._permit.is_set() or self._stopping:
+                return True
+            if self.context.get("simulation") is not True or not self.observation.success:
+                raise StateConflict("Free-space reset handoff was not independently verified.")
+            self.phase = "initializing"
+            next_seed = self.config.seed
+            obs = await self._env(self.adapter.reset, seed=next_seed, task_id=self.config.task_id)
+            self._scene_seed = next_seed
+            self._capture(obs)
+            self.context = await self._env(self.adapter.describe)
+            self.context["action_spec"] = self.adapter.action_spec.to_dict()
+            self._scene_ready = True
+            self.stats["hard_resets"] += 1
+            self.episode["environment_reset_done"] = True
+            self.recorder.write({"kind": "control", "event": "verified_free_space_environment_reset", "seed": next_seed})
+            self.recorder.finish_episode(dict(self.episode))
+            self._write_summary()
+            if self._stopping:
+                return False
+            if not self._permit.is_set():
+                self.phase = "completed" if self._batch_done() else "paused"
+                self._write_summary()
+                return self.phase != "completed"
         if self._batch_done():
             self.phase = "completed"
             self._permit.clear()
@@ -398,9 +546,12 @@ class Runner:
         index = self.episode["index"] + 1
         if self.config.reset_mode == "agent":
             obs = await self._env(self.adapter.begin_task)
+        elif self.config.reset_mode == "free_space":
+            obs = self.observation
         else:
             self.stats["hard_resets"] += 1
             obs = await self._env(self.adapter.reset, seed=self.config.seed + index - 1, task_id=self.config.task_id)
+            self._scene_seed = self.config.seed + index - 1
         self.context = await self._env(self.adapter.describe)
         self.context["action_spec"] = self.adapter.action_spec.to_dict()
         self._begin_episode(obs, index)
@@ -414,6 +565,10 @@ class Runner:
             raise ValueError("A continuing decision must contain an action")
         if decision.status != "continue" and decision.actions:
             raise ValueError("Terminal decisions cannot also contain movement")
+        if decision.status == "reconsider" and not (
+                decision.reasoning_effort == "medium" and decision.next_reasoning_effort == "xhigh"
+                and callable(getattr(self.policy, "accept_decision", None))):
+            raise ValueError("Reconsideration requires a medium-to-xhigh policy transition")
         count = 0
         for action in decision.actions:
             spec.validate(action.values)
@@ -429,6 +584,26 @@ class Runner:
                 await self._permit.wait()
                 if self._stopping:
                     return
+                if not self._baseline_resolved:
+                    if self.stats["estimated_cost_usd"] >= self.config.budget_usd:
+                        self._permit.clear()
+                        self.phase = "paused"
+                        self._event("budget", "API cost budget reached. Paused without environment reset.")
+                        continue
+                    epoch = self._epoch
+                    self.phase = "thinking"
+                    self._event("control", "Estimating the task grasp baseline once before collection.")
+                    result = await self._await_policy_request(self._baseline_provider(
+                        self.observation, self.adapter.action_spec, self.context, self._usage_callback()))
+                    if epoch != self._epoch or not self._permit.is_set() or self._stopping or result is None:
+                        continue
+                    baseline = {k: v for k, v in result.items() if k != "usage_event"}
+                    if self._baseline_save:
+                        baseline = self._baseline_save(baseline)
+                    self.configure_grasp_baseline(baseline)
+                    self._event("control", "Task grasp baseline saved. Collection will use executed close attempts.")
+                    self._write_summary()
+                    continue
                 if not await self._advance_stage():
                     return
                 if not self._permit.is_set() or self._stopping:
@@ -474,11 +649,23 @@ class Runner:
                     continue
 
                 self._validate_decision(decision, before)
+                if hasattr(self.policy, "accept_decision"):
+                    self.policy.accept_decision(decision)
                 self.latest_decision = decision.model_dump()
                 if not hasattr(self.policy, "usage_callback"):
                     for key in ("input_tokens", "output_tokens"):
                         self.stats[key] += decision.usage.get(key, 0)
                 self.recorder.write({"kind": "decision", "stage": self.stage, "decision": self.latest_decision})
+                if decision.status == "reconsider":
+                    self.history.append({"stage": self.stage, "observation_id": before.id,
+                        "executed_steps": 0, "note": decision.note,
+                        "reasoning_effort": decision.reasoning_effort,
+                        "next_reasoning_effort": decision.next_reasoning_effort})
+                    self._event("control", "Auto reasoning: medium → xhigh; reconsidering before motion.")
+                    self._write_summary()
+                    if self._single:
+                        await self._pause_after_one()
+                    continue
                 if decision.status != "continue":
                     if decision.status == "success":
                         # A language-model claim never becomes a success label.
@@ -508,6 +695,12 @@ class Runner:
                         started = time.time()
                         obs = await self._env(self.adapter.step, action.values)
                         self._capture(obs)
+                        self._scene_ready = False
+                        applied = obs.info.get("applied_action", action.values)
+                        if self._grasp_counter.applied(applied, self.stage):
+                            self.recorder.write({"kind": "gripper_close", "stage": self.stage,
+                                "observation_id": prior.id, "count": self._grasp_counter.counts[self.stage]})
+                        self.episode["quality"][self.stage] = self._grasp_counter.quality(self.stage, None, self._grasp_baseline)
                         executed += 1
                         self.episode["stage_steps"] += 1
                         self.episode["reset_steps" if self.stage == "reset" else "steps"] += 1
@@ -546,6 +739,8 @@ class Runner:
                     "success": self.observation.success, "state_before": before.state,
                     "state_after": self.observation.state, "actions": [x.model_dump() for x in decision.actions],
                     "note": decision.note,
+                    "reasoning_effort": decision.reasoning_effort,
+                    "next_reasoning_effort": decision.next_reasoning_effort,
                 }
                 self.history.append(self.latest_receipt)
                 self.recorder.write({"kind": "receipt", **self.latest_receipt})
@@ -575,6 +770,11 @@ class Runner:
                     self._finish_stage("error")
                 except Exception:
                     pass
+            if (self.recorder and self.config.reset_mode == "free_space"
+                    and self.episode.get("reset_outcome") == "success"
+                    and not self.episode.get("environment_reset_done")):
+                self.episode["environment_reset_error"] = self.error
+                self.recorder.finish_episode(dict(self.episode))
             self.phase = "error"
             self._event("error", self.error)
             self._write_summary()
@@ -583,6 +783,7 @@ class Runner:
         if self.episode.get("outcome"):
             return
         self.episode["outcome"] = outcome
+        self._finish_quality("task", outcome)
         self.episode["finished_at"] = time.time()
         self.stats["episodes"] += 1
         self.stats["successes"] += int(outcome == "success")
@@ -599,17 +800,24 @@ class Runner:
             self._finish_episode(outcome)
         elif not self.episode.get("reset_outcome"):
             self.episode["reset_outcome"] = outcome
+            self._finish_quality("reset", outcome)
             self.episode["reset_finished_at"] = time.time()
             self.stats["reset_successes"] += int(outcome == "success")
             self.recorder.write({"kind": "stage_end", "stage": "reset", "outcome": outcome})
-            self.recorder.finish_episode(dict(self.episode))
+            if self.config.reset_mode != "free_space" or outcome != "success":
+                self.recorder.finish_episode(dict(self.episode))
             self._event("reset", f"GPT reset ended: {outcome}." + (" Environment was not reset; operator review needed." if outcome != "success" else ""))
         self._write_summary()
 
     def status(self) -> dict:
         obs = self.observation
         return {"phase": self.phase, "stage": self.stage, "busy": self.phase in ("initializing", "thinking", "executing", "pausing"),
+                "environment_connected": self.environment_connected,
+                "can_start_new_run": self.can_start_new_run,
                 "backend": self.settings.backend, "policy": self.settings.policy, **self.policy_config,
+                "run_started": self._run_started,
+                "current_reasoning_effort": getattr(self.policy, "current_reasoning_effort", None) or (
+                    "medium" if self._policy_settings.reasoning_effort == "auto" else self._policy_settings.reasoning_effort),
                 "api_key_configured": bool(self.settings.api_key),
                 "config": {"suite": self.settings.suite, **self.config.model_dump()},
                 "episode": dict(self.episode), "observation": None if obs is None else {

@@ -24,7 +24,7 @@ _MODELS = {
 def policy_catalog() -> list[dict]:
     """Return public capabilities; no key, account lookup, or paid API call."""
     return [{"model": model, "label": values["label"],
-             "reasoning_efforts": list(values["reasoning_efforts"]),
+             "reasoning_efforts": [*values["reasoning_efforts"], "auto"],
              "default_reasoning_effort": "medium",
              "pricing_source": f"https://developers.openai.com/api/docs/models/{model}"}
             for model, values in _MODELS.items()]
@@ -40,6 +40,6 @@ class PolicyConfig(BaseModel):
         capabilities = _MODELS.get(self.model)
         if capabilities is None:
             raise ValueError("Choose a supported GPT model from the model catalog")
-        if self.reasoning_effort not in capabilities["reasoning_efforts"]:
+        if self.reasoning_effort not in (*capabilities["reasoning_efforts"], "auto"):
             raise ValueError(f"{self.model} does not support reasoning effort {self.reasoning_effort}")
         return self

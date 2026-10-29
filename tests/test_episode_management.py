@@ -64,7 +64,7 @@ def digest(root):
             for path in root.rglob("*") if path.is_file()}
 
 
-def test_archive_restore_persistence_counts_and_lifetime_spend(tmp_path):
+def test_archive_restore_persistence_counts_and_retained_spend(tmp_path):
     store, project_id, root = fixture_store(tmp_path)
     original = digest(root)
     store.archive_episode(project_id, "recorded", "episode-0001", archived=True)
@@ -82,7 +82,7 @@ def test_archive_restore_persistence_counts_and_lifetime_spend(tmp_path):
 
 
 @pytest.mark.parametrize("metered", [True, False])
-def test_delete_payload_and_unique_media_preserves_other_episode_and_expense(tmp_path, metered):
+def test_delete_payload_and_unique_media_excludes_deleted_episode_expense(tmp_path, metered):
     store, project_id, root = fixture_store(tmp_path, metered=metered)
     other = digest(root / "episode-0001")
     ledger = (root / "api_calls.jsonl").read_bytes() if metered else None
@@ -102,11 +102,60 @@ def test_delete_payload_and_unique_media_preserves_other_episode_and_expense(tmp
     (root / "summary.json").write_text(stale_summary)
     result = ProjectStore(store.data_dir).details(store.get(project_id))
     assert [ep["id"] for ep in result["episodes"]] == ["episode-0001"]
-    assert result["project"]["stats"]["estimated_cost_usd"] == 3
-    assert result["project"]["stats"]["total_tokens"] == 240
+    assert result["project"]["stats"]["estimated_cost_usd"] == 1.5
+    assert result["project"]["stats"]["total_tokens"] == 120
+    assert result["project"]["stats"]["input_tokens"] == 100
+    assert result["project"]["stats"]["output_tokens"] == 20
+    assert result["project"]["stats"]["api_requests"] == 1
     with pytest.raises(KeyError):
         store.episode_detail(project_id, "recorded", "episode-0002")
     store.delete_episode(project_id, "recorded", "episode-0002")  # Idempotent.
+
+
+@pytest.mark.parametrize("metered", [True, False])
+def test_archived_usage_remains_and_deleted_usage_never_returns(tmp_path, metered):
+    store, project_id, root = fixture_store(tmp_path, metered=metered)
+    store.archive_episode(project_id, "recorded", "episode-0001", archived=True)
+    store.delete_episode(project_id, "recorded", "episode-0002")
+    if metered:
+        # Both a known charge and an unknown late receipt for the deleted
+        # episode must stay excluded; an archived episode still accumulates.
+        late = [
+            {"attempt_id": "late-deleted", "episode_id": "episode-0002", "stage": "reset",
+             "tokens": {"total_tokens": 999}, "estimated_cost_usd": 20},
+            {"attempt_id": "unknown-deleted", "episode_id": "episode-0002", "stage": "task",
+             "tokens": None, "estimated_cost_usd": None, "cost_unknown": True},
+            {"attempt_id": "late-kept", "episode_id": "episode-0001", "stage": "reset",
+             "tokens": {"total_tokens": 10}, "estimated_cost_usd": .5},
+            {"attempt_id": "unknown-kept", "episode_id": "episode-0001", "stage": "reset",
+             "tokens": None, "estimated_cost_usd": None, "cost_unknown": True},
+        ]
+        with (root / "api_calls.jsonl").open("a") as handle:
+            for row in late + [late[2]]:  # Duplicate receipt counts only once.
+                handle.write(json.dumps(row) + "\n")
+    else:
+        # Old installations persisted deleted costs in their tombstones.
+        state = store._load()
+        state["episode_state"]["recorded"]["episode-0002"]["retained_usage"] = {
+            "estimated_cost_usd": 99, "total_tokens": 9999, "api_requests": 7}
+        store._save(state)
+    settings = Settings(backend="demo", policy="scripted", suite="demo", data_dir=store.data_dir)
+    with TestClient(create_app(settings)) as client:
+        project = client.get(f"/api/projects/{project_id}").json()
+        workspace = client.get("/api/workspace").json()
+        assert project["project"]["usage_scope"] == "active_and_archived_episodes"
+        assert project["episodes"] == []
+        assert len(project["archived_episodes"]) == 1
+        for stats in (project["project"]["stats"], workspace["totals"]):
+            assert stats["estimated_cost_usd"] == (2 if metered else 1.5)
+            assert stats["total_tokens"] == (130 if metered else 120)
+            assert stats["api_requests"] == (3 if metered else 1)
+            assert stats["unknown_usage_requests"] == int(metered)
+        route = f"/api/projects/{project_id}/episodes/recorded/episode-0001/delete"
+        assert client.post(route, json={"confirm": True}).status_code == 200
+        totals = client.get("/api/workspace").json()["totals"]
+        assert totals["estimated_cost_usd"] == totals["total_tokens"] == totals["api_requests"] == 0
+        assert totals["unknown_usage_requests"] == 0
 
 
 def test_detail_public_notes_and_actions_pagination_and_archive_access(tmp_path):
@@ -192,6 +241,7 @@ def test_deletion_failure_is_pending_and_retry_completes(tmp_path, monkeypatch):
     assert pending["id"] == "episode-0001"
     assert "costs" not in pending
     assert "outcome" not in pending
+    assert store.details(store.get(project_id))["project"]["stats"]["estimated_cost_usd"] == 1.5
     with pytest.raises(KeyError):
         store.archive_episode(project_id, "recorded", "episode-0001", archived=False)
     monkeypatch.setattr(project_module.shutil, "rmtree", real_remove)

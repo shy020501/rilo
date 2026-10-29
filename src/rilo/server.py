@@ -8,9 +8,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from rilo.config import Settings
 from rilo.projects import CAPABILITIES, ProjectCreate, ProjectSettings, ProjectStore, empty_stats
@@ -18,6 +18,7 @@ from rilo.policy_settings import PolicyConfig, policy_catalog
 from rilo.recording import dump_json
 from rilo.runner import Runner, RunConfig, StateConflict
 from rilo.pipeline import PipelineEngine, PipelineStart
+from rilo.video_jobs import create_video_router
 
 
 class InitializeProject(BaseModel):
@@ -35,17 +36,24 @@ class DeleteEpisode(BaseModel):
     confirm: bool
 
 
+class GraspBaselineSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_closures: int | None = Field(ge=0, le=100)
+
+
 def create_app(settings: Settings | None = None, *, runner: Runner | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     controller = runner or Runner(settings)
     projects = ProjectStore(settings.data_dir)
     active_project_id: str | None = None
+    connection_only_mode = False
     ownership_lock = asyncio.Lock()
     retired_controllers: list[Runner] = []
 
     @asynccontextmanager
     async def lifespan(app):
         yield
+        await video_jobs.close()
         await pipeline.close()
         await controller.close()
 
@@ -80,7 +88,15 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
         return Response(dump_json({"detail": str(exc)}), status_code=409, media_type="application/json")
 
     def snapshot():
-        return Response(dump_json({**controller.status(), "active_project_id": active_project_id,
+        status = controller.status()
+        if active_project_id and controller.recorder and status.get("episode", {}).get("id"):
+            try:
+                number = projects.episode_display_index(active_project_id, controller.recorder.run_id,
+                                                       status["episode"]["id"])
+                status["episode"] = {**status["episode"], "display_index": number}
+            except (KeyError, OSError, ValueError):
+                pass
+        return Response(dump_json({**status, "active_project_id": active_project_id,
                                    "pipeline_runtime": pipeline.runtime()}), media_type="application/json")
 
     def require_manual_control():
@@ -101,7 +117,7 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
     def project_policy(project):
         return project.get("policy_config") or policy_options()["defaults"]
 
-    def management_reason(run_id):
+    def execution_management_reason(run_id):
         if pipeline.active and run_id in projects.get(pipeline.runtime()["project_id"])["run_ids"]:
             return "이 프로젝트의 학습/평가가 실행 중입니다. 파이프라인을 중지한 뒤 데이터를 변경하세요."
         # A retired provider request can still append its usage to an older run.
@@ -117,6 +133,11 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
             if controller._inference is not None and not controller._inference.done():
                 return "GPT 요청이 아직 종료되지 않았습니다. 잠시 후 다시 시도하세요."
         return None
+
+    def management_reason(run_id):
+        if video_jobs.is_busy(run_id):
+            return "영상 생성 중입니다. 완료된 뒤 데이터를 변경하세요."
+        return execution_management_reason(run_id)
 
     def episode_controls(episode):
         reason = management_reason(episode["run_id"])
@@ -147,7 +168,7 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
     def require_owner(project_id):
         get_project(project_id)
         if project_id != active_project_id:
-            raise StateConflict("This project does not own the active collection. Initialize it first.")
+            raise StateConflict("This project does not own the active collection. Connect its environment first.")
 
     def link_current(project_id):
         if project_id and controller.recorder:
@@ -222,9 +243,42 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
 
     @app.post("/api/projects/{project_id}/settings")
     async def project_settings(project_id: str, data: ProjectSettings):
-        get_project(project_id)
-        projects.update(project_id, data)
-        return {"project": project_detail(project_id)["project"]}
+        async with ownership_lock:
+            get_project(project_id)
+            saved = projects.update(project_id, data)
+            episode_goal_applied = False
+            if (data.run_config is not None and active_project_id == project_id
+                    and not pipeline.active):
+                episode_goal_applied = await controller.update_prepared_episode_goal(
+                    saved["run_config"]["episodes"])
+            return {"project": project_detail(project_id)["project"],
+                    "episode_goal_applied": episode_goal_applied}
+
+    @app.post("/api/projects/{project_id}/grasp-baseline")
+    async def grasp_baseline_settings(project_id: str, data: GraspBaselineSettings):
+        async with ownership_lock:
+            get_project(project_id)
+            baseline = projects.set_grasp_baseline(project_id,
+                {"expected_closures": data.expected_closures} if data.expected_closures is not None else None)
+            return {"project": project_detail(project_id)["project"], "grasp_baseline": baseline}
+
+    def configure_baseline(project, *, allow_estimation=True):
+        baseline = projects.grasp_baseline(project)
+        provider = save = None
+        if (allow_estimation and baseline is None and controller.settings.policy == "openai"
+                and type(controller.context.get("gripper_control", {}).get("action_index")) is int):
+            from rilo.grasp_baseline import estimate_grasp_baseline
+            selected = replace(controller.settings, **controller.policy_config)
+            async def provider(obs, spec, context, callback):
+                return await estimate_grasp_baseline(selected, obs, spec, context, usage_callback=callback)
+            def save(value):
+                # A manual override made during inference wins for future runs;
+                # this run still uses its own accepted estimate snapshot.
+                current = projects.grasp_baseline(project)
+                if current is not None:
+                    return {**value, "source": "gpt", "version": None}
+                return projects.set_grasp_baseline(project["id"], value, source="gpt")
+        controller.configure_grasp_baseline(baseline, provider=provider, save=save)
 
     @app.get("/api/projects/{project_id}/episodes/{run_id}/{episode_id}/detail")
     async def episode_detail(project_id: str, run_id: str, episode_id: str,
@@ -277,9 +331,39 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
         require_manual_control()
         return await initialize_owned_project(project_id, request)
 
+    @app.post("/api/projects/{project_id}/connect")
+    async def connect_project(project_id: str):
+        nonlocal controller, active_project_id, connection_only_mode
+        async with ownership_lock:
+            require_manual_control()
+            project = get_project(project_id)
+            if not availability(project)["runnable"]:
+                raise StateConflict(availability(project)["unavailable_reason"])
+            if controller.phase in ("thinking", "executing", "initializing", "pausing", "paused") and controller.status()["run_started"]:
+                raise StateConflict("Stop the current run before reconnecting.")
+            if active_project_id != project_id and controller.phase == "ready":
+                raise StateConflict("Stop the prepared run before connecting another project.")
+            try:
+                if project["suite"] != controller.settings.suite:
+                    if runner is not None:
+                        raise StateConflict("Injected controller cannot change suite.")
+                    await controller.close()
+                    if any(not task.done() for task in controller._retired_requests):
+                        retired_controllers.append(controller)
+                    controller = Runner(replace(settings, suite=project["suite"], task_id=project["task_id"]))
+                    app.state.runner = controller
+                await controller.connect_environment(task_id=project["task_id"], seed=project["run_config"]["seed"])
+                active_project_id, connection_only_mode = project_id, True
+            except StateConflict:
+                raise
+            except Exception as exc:
+                raise HTTPException(503, controller._safe_error(exc)) from None
+            return snapshot()
+
     async def initialize_owned_project(project_id, request, *, config_override=None,
-                                       policy_override=None, recording_metadata=None, pipeline_owned=False):
-        nonlocal controller, active_project_id
+                                       policy_override=None, recording_metadata=None, pipeline_owned=False,
+                                       reuse_scene=False, policy_config_snapshot=None):
+        nonlocal controller, active_project_id, connection_only_mode
         async with ownership_lock:
             if not pipeline_owned:
                 require_manual_control()
@@ -309,13 +393,18 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
                     app.state.runner = controller
                 if not request.preserve_environment:
                     active_project_id = None
-                policy_config = (PolicyConfig.model_validate(project["policy_config"])
-                                 if project.get("policy_config") else None)
+                chosen_policy = policy_config_snapshot if policy_config_snapshot is not None else project.get("policy_config")
+                policy_config = PolicyConfig.model_validate(chosen_policy) if chosen_policy else None
                 await controller.initialize(config, preserve_environment=request.preserve_environment,
                                             policy_config=policy_config, policy_override=policy_override,
-                                            recording_metadata=recording_metadata)
+                                            recording_metadata=recording_metadata, from_connected=reuse_scene)
                 active_project_id = project_id
+                connection_only_mode = False
                 link_current(project_id)
+                pure_bc_evaluation = bool(policy_override is not None
+                    and (recording_metadata or {}).get("pipeline_stage") == "bc_eval"
+                    and config.reset_mode == "environment")
+                configure_baseline(project, allow_estimation=not pure_bc_evaluation)
             except StateConflict:
                 raise
             except Exception as exc:
@@ -328,6 +417,8 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
         async with ownership_lock:
             require_manual_control()
             require_owner(project_id)
+            if connection_only_mode and not (controller.phase == "paused" and controller.status()["run_started"]):
+                await prepare_manual_run(project_id)
             return await begin()
 
     @app.post("/api/projects/{project_id}/step")
@@ -335,7 +426,19 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
         async with ownership_lock:
             require_manual_control()
             require_owner(project_id)
-            return await begin(single=True)
+            if controller.status()["run_started"] and controller.phase not in ("completed", "stopped", "connected"):
+                raise StateConflict("Resume or stop the current run before starting one episode.")
+            await prepare_manual_run(project_id, episodes=1)
+            return await begin()
+
+    async def prepare_manual_run(project_id, *, episodes=None):
+        project = get_project(project_id)
+        config = RunConfig.model_validate({**project["run_config"], "task_id": project["task_id"],
+            **({"episodes": episodes} if episodes is not None else {})})
+        policy = PolicyConfig.model_validate(project["policy_config"]) if project.get("policy_config") else None
+        await controller.initialize(config, policy_config=policy, from_connected=True)
+        configure_baseline(project)
+        link_current(project_id)
 
     @app.post("/api/projects/{project_id}/pause")
     async def pause_project(project_id: str):
@@ -366,11 +469,16 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
         return FileResponse(path)
 
     @app.get("/api/frame/{camera}")
-    async def frame(camera: str):
+    async def frame(camera: str, project_id: str | None = None, run_id: str | None = None,
+                    observation_id: str | None = None):
+        if (project_id is not None and project_id != active_project_id
+                or run_id is not None and (controller.recorder is None or run_id != controller.recorder.run_id)
+                or observation_id is not None and (controller.observation is None or observation_id != controller.observation.id)):
+            raise HTTPException(404, "The requested project, run, or observation is no longer active")
         data = controller.frames.get(camera)
         if data is None:
             raise HTTPException(404, "Camera is not available. Initialize the environment first.")
-        return Response(data, media_type="image/jpeg")
+        return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     @app.post("/api/initialize")
     async def initialize(config: RunConfig):
@@ -419,7 +527,15 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
     @app.post("/api/step")
     async def step():
         async with ownership_lock:
-            return await begin(single=True)
+            require_manual_control()
+            if controller.status()["run_started"] and controller.phase not in ("completed", "stopped", "connected"):
+                raise StateConflict("Resume or stop the current run before starting one episode.")
+            if active_project_id:
+                await prepare_manual_run(active_project_id, episodes=1)
+            else:
+                config = controller.config.model_copy(update={"episodes": 1})
+                await controller.initialize(config, from_connected=True)
+            return await begin()
 
     @app.post("/api/pause")
     async def pause():
@@ -464,41 +580,70 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
 
     async def prepare_pipeline_run(project_id, episodes, task_policy, metadata, budget):
         project = get_project(project_id)
-        preserve = bool(active_project_id == project_id and controller.stage == "reset"
+        is_evaluation = metadata.get("pipeline_stage") in ("bc_eval", "rl_eval")
+        frozen = metadata.get("evaluation_config_snapshot", {}) if is_evaluation else {}
+        run_config = frozen.get("run_config", project["run_config"])
+        reset_mode = (metadata.get("reset_mode", "agent") if is_evaluation else
+                      "free_space" if project["run_config"].get("reset_mode") == "free_space" else "agent")
+        if reset_mode not in ("agent", "environment", "free_space"):
+            raise StateConflict("Unsupported evaluation reset mode")
+        environment_evaluation = is_evaluation and reset_mode == "environment"
+        if environment_evaluation:
+            await controller._ensure_adapter()
+            context = await controller._env(controller.adapter.describe)
+            if context.get("simulation") is not True:
+                raise StateConflict("Environment reset evaluation requires a simulator; physical robots must use verified reset.")
+        preserve = bool(not environment_evaluation and active_project_id == project_id and controller.stage == "reset"
                         and controller.observation and controller.observation.success
                         and controller.phase in ("completed", "paused")
                         and controller.config.task_id == project["task_id"]
-                        and controller.config.seed == project["run_config"]["seed"])
+                        and controller.config.seed == run_config["seed"]
+                        and controller.config.reset_mode != "free_space")
         # Initial setup is allowed only before this project has performed any
         # movement. Every subsequent pipeline rollout must use a verified reset.
         same_scene = active_project_id == project_id and controller.observation is not None
         moved = controller.stats.get("total_steps", 0) > 0
-        if same_scene and moved and not preserve:
+        reuse_scene = same_scene and controller.can_start_new_run and not preserve and not environment_evaluation
+        if same_scene and moved and not preserve and not reuse_scene and not environment_evaluation:
             raise StateConflict("검증된 GPT reset이 없어 자동 실행을 멈췄습니다. 환경을 수동 복구한 뒤 다시 시작하세요.")
-        overrides = {"episodes": episodes, "reset_mode": "agent", "budget_usd": budget}
+        overrides = {**(run_config if is_evaluation else {}),
+                     "episodes": episodes, "reset_mode": reset_mode, "budget_usd": budget}
         if task_policy is not None:
-            overrides["max_decisions"] = project["run_config"]["max_steps"]
+            overrides["max_decisions"] = run_config["max_steps"]
         await initialize_owned_project(project_id, InitializeProject(preserve_environment=preserve),
-            config_override=overrides, policy_override=task_policy, recording_metadata=metadata, pipeline_owned=True)
+            config_override=overrides, policy_override=task_policy, recording_metadata=metadata,
+            pipeline_owned=True, reuse_scene=reuse_scene, policy_config_snapshot=frozen.get("policy_config"))
         return controller
 
     pipeline = PipelineEngine(settings, projects, lambda: controller, prepare_pipeline_run)
     app.state.pipeline = pipeline
+    video_router, video_jobs = create_video_router(projects, execution_management_reason)
+    app.include_router(video_router)
+    app.state.video_jobs = video_jobs
 
     @app.get("/api/projects/{project_id}/pipeline")
     async def pipeline_view(project_id: str):
         get_project(project_id)
-        return pipeline.view(project_id)
+        return await asyncio.to_thread(pipeline.view, project_id)
+
+    @app.get("/api/projects/{project_id}/learning/bc/history")
+    async def bc_training_history(project_id: str, model_id: str | None = None):
+        try:
+            history = await asyncio.to_thread(pipeline.bc_history, project_id, model_id)
+        except (KeyError, FileNotFoundError, ValueError, OSError):
+            raise HTTPException(404, "BC training history not found") from None
+        return JSONResponse(history, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/projects/{project_id}/pipeline/config")
     async def pipeline_config(project_id: str, data: dict):
         get_project(project_id)
-        try:
-            return pipeline.configure(project_id, data)
-        except StateConflict:
-            raise
-        except (ValueError, ImportError) as exc:
-            raise HTTPException(422, controller._safe_error(exc)) from None
+        async with ownership_lock:
+            try:
+                return await asyncio.to_thread(pipeline.configure, project_id, data)
+            except StateConflict:
+                raise
+            except (ValueError, ImportError) as exc:
+                raise HTTPException(422, controller._safe_error(exc)) from None
 
     @app.post("/api/projects/{project_id}/pipeline/start")
     async def pipeline_start(project_id: str, data: PipelineStart):
