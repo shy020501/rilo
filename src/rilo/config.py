@@ -5,6 +5,12 @@ from pathlib import Path
 import os
 
 
+REMOTE_ROBOT_BACKEND = "remote_robot"
+REMOTE_ROBOT_CONNECTION_ONLY_REASON = (
+    "원격 로봇은 로봇 client / 정책 서버 패널에서 SSH 연결하고 실행하세요. 로컬 Runner·자동 파이프라인은 사용할 수 없습니다."
+)
+
+
 @dataclass(frozen=True)
 class Settings:
     backend: str = "libero"

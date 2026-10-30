@@ -37,12 +37,13 @@
       <p class="dialog-description">하나의 task를 중심으로 데이터와 실행을 모으세요.</p>
       <div class="form-grid">
         <label class="field full">프로젝트 이름 <input id="create-name" name="name" maxlength="120" required placeholder="[LIBERO] 상단 서랍" autocomplete="off"></label>
-        <label class="field">환경 <input id="create-backend" readonly value="LIBERO"></label>
-        <label class="field">Task suite <select id="create-suite" name="suite"><option value="libero_90">LIBERO 90</option><option value="libero_goal">LIBERO Goal</option><option value="libero_spatial">LIBERO Spatial</option><option value="libero_object">LIBERO Object</option><option value="libero_10">LIBERO 10</option></select></label>
-        <label class="field full">Task <select id="create-task" name="task_id" required><option value="">Task를 불러오는 중…</option></select><small id="task-help">프로젝트를 만들어도 환경이나 모델은 실행되지 않습니다.</small></label>
+        <label class="field">환경 <select id="create-backend" name="backend" required><option value="" selected disabled>환경을 선택하세요</option><option value="libero">LIBERO</option><option value="remote_robot">원격 로봇</option></select></label>
+        <label id="create-suite-field" class="field">Task suite <select id="create-suite" name="suite"><option value="libero_90">LIBERO 90</option><option value="libero_goal">LIBERO Goal</option><option value="libero_spatial">LIBERO Spatial</option><option value="libero_object">LIBERO Object</option><option value="libero_10">LIBERO 10</option></select></label>
+        <label id="create-catalog-task-field" class="field full">Task <select id="create-task" name="task_id" required><option value="">Task를 불러오는 중…</option></select><small id="task-help">프로젝트를 만들어도 환경이나 모델은 실행되지 않습니다.</small></label>
+        <label id="create-remote-task-field" class="field full" hidden>작업 이름 <input id="create-remote-task" name="remote_task_name" maxlength="300" placeholder="예: 로봇 PC 연결 확인" disabled><small>SSH와 로봇 client를 별도로 연결합니다. 프로젝트 생성은 로봇이나 정책을 실행하지 않습니다.</small></label>
         <label class="field full">설명 <span class="optional">선택</span><textarea name="description" rows="2" maxlength="2000" placeholder="이 프로젝트에서 수집하고 학습할 작업을 설명해주세요."></textarea></label>
       </div>
-      <div class="goal-fields"><div class="section-kicker">파이프라인 초기 목표</div><div class="form-grid three">
+      <div id="create-goal-fields" class="goal-fields"><div class="section-kicker">파이프라인 초기 목표</div><div class="form-grid three">
         <label class="field">성공 episode 목표 <div class="input-unit"><input name="demo_target" type="number" value="20" min="1" max="100" required><span>개</span></div></label>
         <label class="field">BC 성공률 목표 <div class="input-unit"><input name="bc_success_target" type="number" value="70" min="1" max="100" required><span>%</span></div></label>
         <label class="field">RL 성공률 목표 <div class="input-unit"><input name="rl_success_target" type="number" value="90" min="1" max="100" required><span>%</span></div></label>
@@ -72,6 +73,18 @@
       <footer class="dialog-actions"><button type="button" class="button secondary" data-close-dialog>취소</button><button id="stage-start-confirm" type="submit" class="button primary">설정 저장 후 실행</button></footer>
     </form>
   </dialog>
+  <dialog id="remote-token-dialog" class="dialog robot-host-key-dialog" aria-labelledby="remote-token-title">
+    <header class="dialog-heading"><div><span class="eyebrow">CLIENT TOKEN</span><h2 id="remote-token-title">연결 토큰 재발급</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="닫기"><span data-icon="close"></span></button></header>
+    <p class="dialog-description">재발급하면 기존 토큰과 client 세션을 사용할 수 없습니다. 새 연결 설정을 다운로드해 로봇 PC의 client에 적용해야 합니다.</p>
+    <footer class="dialog-actions"><button type="button" class="button secondary" data-close-dialog>취소</button><button id="remote-token-confirm" type="button" class="button primary" data-action="remote-token-confirm">토큰 재발급</button></footer>
+  </dialog>
+  <dialog id="robot-host-key-dialog" class="dialog robot-host-key-dialog" aria-labelledby="robot-host-key-title">
+    <header class="dialog-heading"><div><span class="eyebrow">SSH HOST KEY</span><h2 id="robot-host-key-title">호스트 키 확인</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="닫기"><span data-icon="close"></span></button></header>
+    <div id="robot-host-key-content"></div>
+    <p id="robot-host-key-note" class="field-note" role="status"></p>
+    <p id="robot-host-key-error" class="form-error" role="alert" hidden></p>
+    <footer class="dialog-actions"><button type="button" class="button secondary" data-close-dialog>취소</button><button id="robot-host-key-trust" type="button" class="button primary" data-action="robot-host-key-trust">확인한 호스트 키 등록</button></footer>
+  </dialog>
   <dialog id="bc-history-dialog" class="dialog bc-history-dialog" aria-labelledby="bc-history-title">
     <header class="dialog-heading"><div><span class="eyebrow">BC TRAINING HISTORY</span><h2 id="bc-history-title">BC 학습 기록</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="닫기"><span data-icon="close"></span></button></header>
     <p id="bc-history-identity" class="dialog-description"></p>
@@ -92,6 +105,14 @@
     <p class="field-note">이미 발생한 API 사용량·비용 기록은 유지됩니다. 목록에서 숨기려면 보관 기능을 사용하세요.</p>
     <p id="delete-error" class="form-error" role="alert" hidden></p>
     <footer class="dialog-actions"><button type="button" class="button secondary" data-close-dialog autofocus>취소</button><button id="delete-confirm" type="button" class="button danger" data-action="confirm-delete">영구 삭제</button></footer>
+  </dialog>
+  <dialog id="project-delete-dialog" class="dialog delete-dialog" aria-labelledby="project-delete-title">
+    <header class="dialog-heading"><div><span class="eyebrow">DELETE PROJECT</span><h2 id="project-delete-title">프로젝트를 영구 삭제할까요?</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="닫기"><span data-icon="close"></span></button></header>
+    <div class="delete-episode-info"><strong id="project-delete-name"></strong></div>
+    <p class="dialog-description">프로젝트와 연결된 episode·영상·학습 모델·설정을 삭제합니다. 삭제한 데이터는 복구할 수 없습니다.</p>
+    <p class="field-note">다른 프로젝트가 함께 사용하는 실행 기록은 유지합니다. 데이터를 남기려면 프로젝트 보관을 사용하세요.</p>
+    <p id="project-delete-error" class="form-error" role="alert" hidden></p>
+    <footer class="dialog-actions"><button type="button" class="button secondary" data-close-dialog autofocus>취소</button><button id="project-delete-confirm" type="button" class="button danger" data-action="confirm-delete-project">영구 삭제</button></footer>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </body>

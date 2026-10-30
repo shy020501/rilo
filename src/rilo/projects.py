@@ -341,6 +341,8 @@ class ProjectStore:
         with self._lock:
             state = self._load()
             assigned = {run for p in state["projects"] for run in p["run_ids"]}
+            assigned.update(run for tombstone in state.get("deleted_projects", {}).values()
+                            for run in tombstone.get("deleted_run_ids", []))
             changed = False
             for ledger in sorted(self.data_dir.glob("*/api_calls.jsonl")):
                 run_id = ledger.parent.name
@@ -376,7 +378,8 @@ class ProjectStore:
     def _new(self, data: ProjectCreate, *, created_at=None):
         now = time.time() if created_at is None else created_at
         return {"id": uuid.uuid4().hex, **data.model_dump(),
-                "created_at": now, "updated_at": now, "run_ids": []}
+                "created_at": now, "updated_at": now, "run_ids": [],
+                "archived": False, "archived_at": None, "delete_pending": False}
 
     def create(self, data: ProjectCreate):
         with self._lock:
@@ -397,6 +400,112 @@ class ProjectStore:
             if project["id"] == project_id:
                 return project
         raise KeyError(project_id)
+
+    def archive(self, project_id, archived):
+        if type(archived) is not bool:
+            raise ValueError("archived must be a boolean")
+        with self._lock:
+            state = self._load()
+            project = next((item for item in state["projects"] if item["id"] == project_id), None)
+            if project is None:
+                raise KeyError(project_id)
+            if project.get("delete_pending"):
+                raise ValueError("Finish the pending project deletion before changing archive state")
+            now = time.time()
+            project.update(archived=archived, archived_at=now if archived else None, updated_at=now)
+            self._save(state)
+            return deepcopy(project)
+
+    def _project_deletion_files(self, state, project):
+        """Validate every owned target before persisting intent or deleting files."""
+        project_id = project["id"]
+        if (not isinstance(project_id, str) or Path(project_id).name != project_id
+                or project_id in ("", ".", "..")):
+            raise ValueError("Invalid project identifier")
+        other_runs = {run for item in state["projects"] if item["id"] != project_id for run in item["run_ids"]}
+        shared = sorted(set(project["run_ids"]) & other_runs)
+        exclusive = sorted(set(project["run_ids"]) - other_runs)
+        folders = []
+        for run_id in exclusive:
+            folder = self._run_path(run_id)
+            if folder.is_symlink() or folder.exists() and not folder.is_dir():
+                raise ValueError("Cannot delete a project through a run symlink or non-directory")
+            folders.append(folder)
+        learning_root = self.data_dir.parent / "learning"
+        learning = learning_root / project_id
+        if (learning_root.is_symlink() or learning.is_symlink()
+                or not learning.resolve().is_relative_to(learning_root.resolve())
+                or learning.exists() and not learning.is_dir()):
+            raise ValueError("Invalid project learning artifact directory")
+        folders.append(learning)
+        metadata_paths, media_candidates, shared_media = [], set(), set()
+        for path in self.media_dir.glob("*.json"):
+            try:
+                metadata = _json(path)
+                names = {metadata[key] for key in ("video", "poster") if isinstance(metadata.get(key), str)}
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+            if metadata.get("run_id") not in exclusive:
+                shared_media.update(names)
+                continue
+            if self.media_dir.is_symlink() or path.is_symlink():
+                raise ValueError("Cannot delete project media through a symlink")
+            metadata_paths.append(path)
+            for name in names:
+                if (Path(name).name != name or Path(name).suffix.lower() not in (".mp4", ".jpg", ".jpeg", ".png")):
+                    raise ValueError("Invalid project media filename")
+                target = self.media_dir / name
+                if (target.is_symlink() or not target.resolve().is_relative_to(self.media_dir.resolve())
+                        or target.exists() and not target.is_file()):
+                    raise ValueError("Invalid project media path")
+                media_candidates.add(target)
+        media = [path for path in media_candidates if path.name not in shared_media]
+        return exclusive, shared, folders, media + metadata_paths
+
+    def begin_delete(self, project_id):
+        """Reserve deletion before asynchronous connection cleanup can yield.
+
+        A pending project remains visible in the archive so an interrupted or
+        failed deletion can be retried without guessing which files survived.
+        """
+        with self._lock:
+            state = self._load()
+            project = next((item for item in state["projects"] if item["id"] == project_id), None)
+            if project is None:
+                raise KeyError(project_id)
+            self._project_deletion_files(state, project)
+            if not project.get("delete_pending"):
+                now = time.time()
+                project.update(archived=True, archived_at=project.get("archived_at") or now,
+                               delete_pending=True, deletion_started_at=now, updated_at=now)
+                self._save(state)
+            return deepcopy(project)
+
+    def delete(self, project_id):
+        """Delete only this project's recordings/models; preserve shared sources."""
+        with self._lock:
+            self.begin_delete(project_id)
+            state = self._load()
+            project = next(item for item in state["projects"] if item["id"] == project_id)
+            exclusive, shared, folders, files = self._project_deletion_files(state, project)
+            for folder in folders:
+                if folder.exists():
+                    shutil.rmtree(folder)
+            for path in files:
+                path.unlink(missing_ok=True)
+            state["projects"] = [item for item in state["projects"] if item["id"] != project_id]
+            for run_id in exclusive:
+                state.get("episode_state", {}).pop(run_id, None)
+            baseline_key = self._baseline_key(project)
+            if not any(self._baseline_key(item) == baseline_key for item in state["projects"]):
+                state.get("grasp_baselines", {}).pop(baseline_key, None)
+                state.get("grasp_baseline_versions", {}).pop(baseline_key, None)
+            result = {"project_id": project_id, "deleted": True,
+                      "deleted_run_ids": exclusive, "preserved_run_ids": shared}
+            state.setdefault("deleted_projects", {})[project_id] = {
+                "deleted_at": time.time(), "deleted_run_ids": exclusive}
+            self._save(state)
+            return result
 
     def update(self, project_id, data: ProjectSettings):
         with self._lock:

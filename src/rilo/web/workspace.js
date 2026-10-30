@@ -40,9 +40,16 @@
   const pausePhases = new Set(["initializing", "ready", "thinking", "executing"]);
   const state = {workspace:null,status:null,detail:null,route:{id:null,tab:"overview"},connected:false,pending:null,pendingProjectId:null,pausePending:false,search:"",filter:"all",dataView:"active",episodeMutation:null,deleteTarget:null,deleteBusy:false,episodeDetail:null,episodeToken:0,workspaceSignature:"",detailSignature:"",navSignature:"",barSignature:"",statusBusy:false,statusRequest:0,workspaceBusy:false,routeToken:0,taskToken:0,tasks:[],lastObservation:null,lastCameras:"",lastEvents:"",toastTimer:null,pipeline:null,pipelineProjectId:null,pipelineBusy:false,pipelineRequest:0,pipelinePending:null,pipelinePausePending:false,evaluationStage:"bc_eval",pipelineExecutionSignature:"",modelSignature:"",evaluationSignature:"",evaluationCameraSignature:"",evaluationObservationKey:"",evaluationFrameToken:0,pipelineDialog:null,stageDialog:null,trainingAlgorithms:{},collectionSettingsExpanded:false,collectionSettingsDirty:false,collectionSettingsSignature:"",collectionSettingsSaving:false};
   const routeUrl = (id, tab = "overview") => `#/projects/${encodeURIComponent(id)}${tab === "overview" ? "" : `/${tab}`}`;
+  state.projectView = "active";
+  state.projectMutation = null;
+  state.projectDeleteTarget = null;
+  state.settingsSaving = false;
   const runtime = () => state.status || state.workspace?.runtime || {};
   const activeId = () => runtime().active_project_id;
   const currentProject = () => state.detail?.project;
+  const remoteRobotProject = (project = currentProject()) => project?.backend === "remote_robot";
+  const backendLabel = (backend) => backend === "remote_robot" ? "원격 로봇" : backend?.toUpperCase() || "ROBOT";
+  const remoteConnectionOnlyReason = "원격 로봇은 환경 연결 탭의 client 전용 제어로 실행합니다. 기존 로컬 환경·학습 파이프라인은 이 프로젝트에서 사용하지 않습니다.";
   const stageCost = (episode, stage) => episode.costs?.[stage] || {};
   const episodeCost = (episode) => n(stageCost(episode,"task").estimated_cost_usd) + n(stageCost(episode,"reset").estimated_cost_usd);
   const externalEpisode = (episode) => episode?.source?.kind === "external_dataset";
@@ -159,6 +166,9 @@
   }
 
   function projectStatus(project) {
+    if (project.delete_pending) return {text:"삭제 미완료",style:"warning"};
+    if (project.archived) return {text:"보관됨",style:"neutral"};
+    if (remoteRobotProject(project)) return {text:"원격 client",style:"neutral"};
     const learning = project.pipeline_status || (pipelineRuntime()?.project_id === project.id ? pipelineRuntime() : null);
     if (learning && pipelineActive(learning.phase)) return {text:learning.phase === "paused" ? "파이프라인 일시정지" : pipelineStageName(learning.stage),style:learning.phase === "paused" ? "warning" : "success"};
     const s = runtime();
@@ -214,22 +224,23 @@
     const progress = Math.min(100,n(stats.successes) / goal * 100);
     const status = projectStatus(project);
     const thumbnail = asset(project.thumbnail_url);
-    return `<a class="project-card" href="${routeUrl(project.id)}" aria-label="${esc(project.name)} 프로젝트 열기"><div class="project-image">${thumbnail ? `<img src="${esc(thumbnail)}" alt="${esc(project.name)} 최근 기록" loading="lazy">` : `<div class="project-image-placeholder">${icon("robot")}</div>`}<div class="image-meta"><span class="image-tag">${esc(project.backend?.toUpperCase() || "ROBOT")}</span><span class="image-note">${thumbnail ? "저장된 실행" : "새 프로젝트"}</span></div></div><div class="project-card-body"><div class="card-title-row"><h3>${esc(project.name)}</h3><span class="card-arrow">${icon("arrow")}</span></div><p class="project-description">${esc(project.description || project.task_name || "데이터 수집을 준비하는 프로젝트")}</p><div class="project-state-row">${tag(status.text,status.style)}<span class="state-value">${count(stats.successes)} / ${count(goal)} demos</span></div><div class="progress-track"><span style="width:${progress}%"></span></div></div><div class="project-card-footer"><div><strong>${count(stats.episodes)}</strong>Episodes</div><div><strong>${count(stats.reset_successes)} / ${count(stats.episodes)}</strong>GPT reset</div><div><strong>${money(stats.estimated_cost_usd)}</strong>API 비용</div></div></a>`;
+    const destination = routeUrl(project.id,project.archived ? "settings" : "overview");
+    return `<a class="project-card" href="${destination}" aria-label="${esc(project.name)} 프로젝트 열기"><div class="project-image">${thumbnail ? `<img src="${esc(thumbnail)}" alt="${esc(project.name)} 최근 기록" loading="lazy">` : `<div class="project-image-placeholder">${icon("robot")}</div>`}<div class="image-meta"><span class="image-tag">${esc(backendLabel(project.backend))}</span><span class="image-note">${thumbnail ? "저장된 실행" : "새 프로젝트"}</span></div></div><div class="project-card-body"><div class="card-title-row"><h3>${esc(project.name)}</h3><span class="card-arrow">${icon("arrow")}</span></div><p class="project-description">${esc(project.description || project.task_name || "데이터 수집을 준비하는 프로젝트")}</p><div class="project-state-row">${tag(status.text,status.style)}<span class="state-value">${count(stats.successes)} / ${count(goal)} demos</span></div><div class="progress-track"><span style="width:${progress}%"></span></div></div><div class="project-card-footer"><div><strong>${count(stats.episodes)}</strong>Episodes</div><div><strong>${count(stats.reset_successes)} / ${count(stats.episodes)}</strong>GPT reset</div><div><strong>${money(stats.estimated_cost_usd)}</strong>API 비용</div></div></a>`;
   }
 
   function renderProjectCards() {
     const holder = $("project-cards");
     if (!holder) return;
     const query = state.search.trim().toLowerCase();
-    const projects = (state.workspace?.projects || []).filter(p => [p.name,p.task_name,p.description,p.suite].join(" ").toLowerCase().includes(query));
-    holder.innerHTML = projects.length ? projects.map(projectCard).join("") : `<div class="card-empty">${icon(query ? "search" : "folder")}<h3>${query ? "검색 결과가 없어요" : "첫 번째 프로젝트를 만들어보세요"}</h3><p>${query ? "프로젝트 이름이나 task로 다시 검색해주세요." : "Task를 선택하고 데이터 수집을 시작할 수 있어요."}</p>${query ? "" : `<button class="button primary" data-action="create">${icon("plus")}새 프로젝트</button>`}</div>`;
+    const projects = (state.projectView === "archived" ? state.workspace?.archived_projects || [] : state.workspace?.projects || []).filter(p => [p.name,p.task_name,p.description,p.suite].join(" ").toLowerCase().includes(query));
+    holder.innerHTML = projects.length ? projects.map(projectCard).join("") : `<div class="card-empty">${icon(query ? "search" : "folder")}<h3>${query ? "검색 결과가 없어요" : state.projectView === "archived" ? "보관된 프로젝트가 없습니다" : "첫 번째 프로젝트를 만들어보세요"}</h3><p>${query ? "프로젝트 이름이나 task로 다시 검색해주세요." : state.projectView === "archived" ? "보관한 프로젝트를 열어 설정에서 복원할 수 있습니다." : "Task를 선택하고 데이터 수집을 시작할 수 있어요."}</p>${query || state.projectView === "archived" ? "" : `<button class="button primary" data-action="create">${icon("plus")}새 프로젝트</button>`}</div>`;
   }
 
   function renderHome() {
     if (!state.workspace) return;
     const w = state.workspace, t = w.totals || {}, r = w.runtime || {};
     document.title = "RILO · 워크스페이스";
-    $("content").innerHTML = `<section class="page-heading"><div><span class="eyebrow">WORKSPACE OVERVIEW</span><h1>워크스페이스</h1><p>프로젝트별로 데이터를 모으고, 학습으로 이어지는 흐름을 확인하세요.</p></div><div class="heading-action"><button class="button primary" data-action="create">${icon("plus")}새 프로젝트</button></div></section><section class="metrics" aria-label="전체 실험 지표">${metric("프로젝트",`${count(t.projects)}<span class="metric-unit">개</span>`,`${count(t.runs)}개의 실행 기록`,"folder")}${metric("수집된 성공 demo",`${count(t.successes)}<span class="metric-unit">개</span>`,`${count(t.episodes)} episodes · Task 성공 기준`,"database")}${metric("완료된 GPT reset",`${count(t.reset_successes)}<span class="metric-unit">/ ${count(t.episodes)}</span>`,"Task 후 환경 복구까지 완료", "reset")}${metric("데이터 사용 비용",money(t.estimated_cost_usd),`${count(t.total_tokens)} tokens · 사용 중·보관 중 합계`,"dollar")}</section><div class="home-layout"><section><div class="section-header"><div class="section-header-left"><h2>프로젝트</h2><span class="count-tag">${count(t.projects)}</span></div><label class="search-box">${icon("search")}<input id="project-search" placeholder="프로젝트 검색" aria-label="프로젝트 검색" value="${esc(state.search)}"></label></div><div id="project-cards" class="project-grid"></div><p class="home-footnote">${icon("info")}기존 실행 기록을 프로젝트별로 연결했습니다. 성공 demo와 reset 완료는 각각 집계됩니다.</p></section><aside class="home-aside"><section class="side-panel"><h3>${icon("flow")}파이프라인 연결 상태</h3><ul class="capability-list"><li><span>GPT 데이터 수집 · Reset</span>${tag("사용 가능","success")}</li><li><span>BC · Progress 학습</span>${tag(w.capabilities?.bc ? "사용 가능" : "연결 전",w.capabilities?.bc ? "success" : "neutral")}</li><li><span>BC 정책 평가</span>${tag(w.capabilities?.evaluation ? "사용 가능" : "연결 전",w.capabilities?.evaluation ? "success" : "neutral")}</li><li><span>Residual RL</span>${tag(w.capabilities?.rl ? "사용 가능" : "연결 전",w.capabilities?.rl ? "success" : "neutral")}</li></ul><p class="side-note">${w.capabilities?.bc ? "개요에서 전체 파이프라인을 설정·실행하고, 모델 탭에서 개별 학습을, 평가 탭에서 개별 평가를 관리합니다." : "모델 탭에서 파이프라인 연결 상태를 확인할 수 있습니다."}</p></section><section class="side-panel"><h3>${icon("terminal")}연결된 실행 환경</h3><dl class="runtime-list"><div><dt>Environment</dt><dd>${esc(r.backend?.toUpperCase() || "—")}</dd></div><div><dt>Teacher model</dt><dd class="code">${esc(r.policy === "scripted" ? "Scripted demo" : r.model || "—")}</dd></div><div><dt>Reasoning</dt><dd>${esc(r.reasoning_effort || "—")}</dd></div><div><dt>Worker</dt><dd>1 · ${esc(phaseNames[r.phase] || "실행 대기")}</dd></div></dl><p class="side-note">${r.policy === "scripted" ? "UI 검증용 demo 서버입니다. GPT를 호출하지 않습니다." : "프로젝트를 준비한 뒤 수집 시작을 누르면 모델이 호출됩니다."}</p></section></aside></div>`;
+    $("content").innerHTML = `<section class="page-heading"><div><span class="eyebrow">WORKSPACE OVERVIEW</span><h1>워크스페이스</h1><p>프로젝트별로 데이터를 모으고, 학습으로 이어지는 흐름을 확인하세요.</p></div><div class="heading-action"><button class="button primary" data-action="create">${icon("plus")}새 프로젝트</button></div></section><section class="metrics" aria-label="전체 실험 지표">${metric("프로젝트",`${count(t.projects)}<span class="metric-unit">개</span>`,`${count(t.runs)}개의 실행 기록`,"folder")}${metric("수집된 성공 demo",`${count(t.successes)}<span class="metric-unit">개</span>`,`${count(t.episodes)} episodes · Task 성공 기준`,"database")}${metric("완료된 GPT reset",`${count(t.reset_successes)}<span class="metric-unit">/ ${count(t.episodes)}</span>`,"Task 후 환경 복구까지 완료", "reset")}${metric("데이터 사용 비용",money(t.estimated_cost_usd),`${count(t.total_tokens)} tokens · 사용 중·보관 중 합계`,"dollar")}</section><div class="home-layout"><section><div class="section-header"><div class="section-header-left"><div class="workspace-view-switch" role="group" aria-label="프로젝트 목록"><button type="button" data-action="projects-active" class="${state.projectView === "active" ? "active" : ""}" aria-pressed="${state.projectView === "active"}">프로젝트 <span>${count(w.projects?.length)}</span></button><button type="button" data-action="projects-archived" class="${state.projectView === "archived" ? "active" : ""}" aria-pressed="${state.projectView === "archived"}">${icon("archive")}보관함 <span>${count(w.archived_projects?.length)}</span></button></div></div><label class="search-box">${icon("search")}<input id="project-search" placeholder="프로젝트 검색" aria-label="프로젝트 검색" value="${esc(state.search)}"></label></div><div id="project-cards" class="project-grid"></div><p class="home-footnote">${icon("info")}기존 실행 기록을 프로젝트별로 연결했습니다. 성공 demo와 reset 완료는 각각 집계됩니다.</p></section><aside class="home-aside"><section class="side-panel"><h3>${icon("flow")}파이프라인 연결 상태</h3><ul class="capability-list"><li><span>GPT 데이터 수집 · Reset</span>${tag("사용 가능","success")}</li><li><span>BC · Progress 학습</span>${tag(w.capabilities?.bc ? "사용 가능" : "연결 전",w.capabilities?.bc ? "success" : "neutral")}</li><li><span>BC 정책 평가</span>${tag(w.capabilities?.evaluation ? "사용 가능" : "연결 전",w.capabilities?.evaluation ? "success" : "neutral")}</li><li><span>Residual RL</span>${tag(w.capabilities?.rl ? "사용 가능" : "연결 전",w.capabilities?.rl ? "success" : "neutral")}</li></ul><p class="side-note">${w.capabilities?.bc ? "개요에서 전체 파이프라인을 설정·실행하고, 모델 탭에서 개별 학습을, 평가 탭에서 개별 평가를 관리합니다." : "모델 탭에서 파이프라인 연결 상태를 확인할 수 있습니다."}</p></section><section class="side-panel"><h3>${icon("terminal")}연결된 실행 환경</h3><dl class="runtime-list"><div><dt>Environment</dt><dd>${esc(r.backend?.toUpperCase() || "—")}</dd></div><div><dt>Teacher model</dt><dd class="code">${esc(r.policy === "scripted" ? "Scripted demo" : r.model || "—")}</dd></div><div><dt>Reasoning</dt><dd>${esc(r.reasoning_effort || "—")}</dd></div><div><dt>Worker</dt><dd>1 · ${esc(phaseNames[r.phase] || "실행 대기")}</dd></div></dl><p class="side-note">${r.policy === "scripted" ? "UI 검증용 demo 서버입니다. GPT를 호출하지 않습니다." : "프로젝트를 준비한 뒤 수집 시작을 누르면 모델이 호출됩니다."}</p></section></aside></div>`;
     if (r.policy !== "scripted") {
       document.querySelector(".runtime-list + .side-note").textContent = "프로젝트 설정에서 모델·추론 수준을 선택할 수 있습니다. 변경값은 다음 새 run을 시작할 때 적용됩니다. 환경을 다시 연결할 필요는 없습니다.";
     }
@@ -238,9 +249,9 @@
   }
 
   function projectShell(project) {
-    const tabs = [["overview","개요","flow"],["collection","수집","camera"],["data","데이터","database"],["models","모델","model"],["evaluation","평가","check"],["settings","설정","settings"]];
+    const tabs = [["overview","개요","flow"],["collection",remoteRobotProject(project) ? "환경 연결" : "수집",remoteRobotProject(project) ? "terminal" : "camera"],["data","데이터","database"],["models","모델","model"],["evaluation","평가","check"],["settings","설정","settings"]];
     const status = projectStatus(project);
-    return `<section class="page-heading project-heading"><div><span class="eyebrow">PROJECT WORKSPACE</span><h1>${esc(project.name)}</h1><p>${esc(project.description || project.task_name || "이 프로젝트의 데이터 수집과 학습 흐름을 관리하세요.")}</p><div class="project-title-meta">${tag(project.backend?.toUpperCase() || "ROBOT","outline")}${tag(project.suite || "Custom","outline")}<span class="project-task">Task ${n(project.task_id)} · ${esc(project.task_name || "")}</span></div></div><div class="project-header-actions">${tag(status.text,status.style)}${state.route.tab !== "collection" ? `<a class="button primary" href="${routeUrl(project.id,"collection")}">${icon("camera")}수집 화면</a>` : ""}</div></section><nav class="tabs" aria-label="프로젝트 메뉴">${tabs.map(([id,label,symbol]) => `<a href="${routeUrl(project.id,id)}" class="${state.route.tab === id ? "active" : ""}" ${state.route.tab === id ? 'aria-current="page"' : ""}>${icon(symbol)}${label}${id === "data" ? `<span class="tab-count">${count(project.stats?.episodes)}</span>` : ""}</a>`).join("")}</nav><div id="tab-content"></div>`;
+    return `<section class="page-heading project-heading"><div><span class="eyebrow">PROJECT WORKSPACE</span><h1>${esc(project.name)}</h1><p>${esc(project.description || project.task_name || "이 프로젝트의 데이터 수집과 학습 흐름을 관리하세요.")}</p><div class="project-title-meta">${tag(backendLabel(project.backend),"outline")}${tag(project.suite || "Custom","outline")}<span class="project-task">Task ${n(project.task_id)} · ${esc(project.task_name || "")}</span></div></div><div class="project-header-actions">${tag(status.text,status.style)}${state.route.tab !== "collection" ? `<a class="button primary" href="${routeUrl(project.id,"collection")}">${icon(remoteRobotProject(project) ? "terminal" : "camera")}${remoteRobotProject(project) ? "환경 연결" : "수집 화면"}</a>` : ""}</div></section><nav class="tabs" aria-label="프로젝트 메뉴">${tabs.map(([id,label,symbol]) => `<a href="${routeUrl(project.id,id)}" class="${state.route.tab === id ? "active" : ""}" ${state.route.tab === id ? 'aria-current="page"' : ""}>${icon(symbol)}${label}${id === "data" ? `<span class="tab-count">${count(project.stats?.episodes)}</span>` : ""}</a>`).join("")}</nav><div id="tab-content"></div>`;
   }
 
   function overviewStageProgress(stage, project, pipeline) {
@@ -308,6 +319,7 @@
   }
 
   function renderPipeline(project) {
+    if (remoteRobotProject(project)) return remoteConnectionOnlyPanel(project,"파이프라인 실행");
     const pipeline = currentPipeline(), status = pipeline?.status || {}, enabled = pipelineEnabled();
     const config = pipeline?.config || {}, stages = pipelineStages.filter(stage => stage.id !== "progress");
     const plan = pipeline?.auto_plan, ready = pipelineReadiness("auto"), busy = pipelineActive(status.phase), global = pipelineRuntime();
@@ -338,6 +350,7 @@
   }
 
   function renderOverview(project) {
+    if (remoteRobotProject(project)) {$("tab-content").innerHTML = remoteConnectionOnlyPanel(project,"원격 로봇 PC 연결");return;}
     const stats = project.stats || {};
     const episodes = (state.detail.episodes || []).slice().sort((a,b) => n(b.started_at)-n(a.started_at));
     $("tab-content").innerHTML = `${renderPipeline(project)}<section class="metrics" aria-label="프로젝트 지표">${metric("성공 demo",`${count(stats.successes)}<span class="metric-unit">개</span>`,`${count(stats.episodes)} episodes 중 Task 성공`,"database")}${metric("GPT reset 완료",`${count(stats.reset_successes)}<span class="metric-unit">/ ${count(stats.episodes)}</span>`,"환경 복구 검증 통과","reset")}${metric("전체 실행 step",count(stats.total_steps),"Task + Reset control ticks","layers")}${metric("데이터 사용 비용",money(stats.estimated_cost_usd),`${count(stats.total_tokens)} tokens · 사용 중·보관 중 합계`,"dollar")}</section><div class="overview-bottom"><section class="panel"><div class="panel-header"><h2>최근 episodes</h2><a class="button quiet small" href="${routeUrl(project.id,"data")}">전체 보기 ${icon("arrow")}</a></div>${episodesTable(episodes.slice(0,4),true)}</section><section class="panel"><div class="panel-header"><h2>수집 설정</h2><a href="${routeUrl(project.id,"collection")}" class="icon-button" aria-label="수집 설정 편집">${icon("settings")}</a></div><div class="panel-body"><dl class="project-rules"><div><dt>수집당 episode</dt><dd>${n(project.run_config?.episodes) || 1} episodes</dd></div><div><dt>Reset 방식</dt><dd>${esc(resetModeLabel(project.run_config?.reset_mode))}</dd></div><div><dt>실행당 API 예산</dt><dd>${money(project.run_config?.budget_usd)}</dd></div></dl><p class="muted-info">설정은 새 run을 시작할 때 적용됩니다. Pause·재개는 시작한 run의 설정을 유지합니다.</p></div></section></div>`;
@@ -411,7 +424,7 @@
       if (token !== state.routeToken || state.route.id !== project.id) return;
       state.detail.project = result.project;state.collectionSettingsDirty = false;
       toast("수집 설정을 저장했습니다. Run 설정은 다음 새 run부터 적용하며 현재 run과 Pause·재개 설정은 유지합니다.");
-      await refreshStatus(true);
+      await Promise.allSettled([refreshStatus(true),refreshWorkspace()]);
     } catch (error) {
       const message = `${goalSaved ? "누적 수집 목표는 저장했지만 Run 실행 설정을 저장하지 못했습니다. 입력값을 확인한 뒤 다시 저장해주세요. " : "수집 실행 설정을 저장하지 못했습니다. "}${error.message}`;
       if (token === state.routeToken && $("collection-settings-error")) {setCollectionSettingsExpanded(true);$("collection-settings-error").textContent = message;$("collection-settings-error").hidden = false;}
@@ -555,7 +568,7 @@
   function renderData(project) {
     const archived = state.dataView === "archived";
     const filtered = visibleDataEpisodes();
-    $("tab-content").innerHTML = `<div class="data-toolbar"><div><h2>${archived ? "보관함" : "수집 데이터"}</h2><p>${archived ? "보관한 episode는 대시보드 demo 수와 기본 목록에서 제외됩니다." : `${count(project.stats?.runs)} runs · ${count(project.stats?.episodes)} episodes · 데이터와 GPT 판단 기록`}</p></div><select id="episode-filter" class="filter-select" aria-label="Episode 결과 필터"><option value="all">전체 episodes</option><option value="complete">Task + Reset 완료</option><option value="incomplete">실패 / 복구 미완료</option><option value="task_success">Task 성공 · 전체</option><option value="within_grasp_budget">Task 성공 · Optimal</option><option value="extra_grasp_attempts">Task 성공 · Sub-optimal</option><option value="unknown">Task 성공 · 분류 정보 없음</option></select></div><div class="data-view-switch" role="group" aria-label="데이터 표시 범위"><button class="${!archived ? "selected" : ""}" data-action="data-active" aria-pressed="${!archived}">${icon("database")}데이터 <span>${count(project.stats?.episodes)}</span></button><button class="${archived ? "selected" : ""}" data-action="data-archived" aria-pressed="${archived}">${icon("archive")}보관함 <span>${count(project.archived_count ?? state.detail.archived_episodes?.length)}</span></button></div><section class="panel episode-data-panel">${bulkEpisodeToolbar(filtered)}${episodesTable(filtered)}</section><p class="home-footnote">${icon("info")}${archived ? "보관 해제로 데이터 목록에 다시 표시할 수 있습니다. 보관은 원본 기록과 영상을 유지합니다." : "보관 아이콘은 데이터를 숨기고, 휴지통은 확인 후 episode 기록과 영상을 영구 삭제합니다."}</p><p class="home-footnote billing-note">데이터 사용 비용과 토큰 사용량은 사용 중·보관 중 episode의 합계입니다. 삭제한 episode는 집계에서 제외됩니다.</p>`;
+    $("tab-content").innerHTML = `<div class="data-toolbar"><div><h2>${archived ? "보관함" : "수집 데이터"}</h2><p>${archived ? "보관한 episode는 대시보드 demo 수와 기본 목록에서 제외됩니다." : `${count(project.stats?.runs)} runs · ${count(project.stats?.episodes)} episodes · 데이터와 GPT 판단 기록`}</p></div><select id="episode-filter" class="filter-select" aria-label="Episode 결과 필터"><option value="all">전체 episodes</option><option value="complete">Task + Reset 완료</option><option value="incomplete">실패 / 복구 미완료</option><option value="task_success">Task 성공 · 전체</option><option value="within_grasp_budget">Task 성공 · Optimal</option><option value="extra_grasp_attempts">Task 성공 · Sub-optimal</option><option value="unknown">Task 성공 · 분류 정보 없음</option></select></div><div class="data-view-switch" role="group" aria-label="데이터 표시 범위"><button class="${!archived ? "selected" : ""}" data-action="data-active" aria-pressed="${!archived}">${icon("database")}데이터 <span>${count(project.stats?.episodes)}</span></button><button class="${archived ? "selected" : ""}" data-action="data-archived" aria-pressed="${archived}">${icon("archive")}보관함 <span>${count(project.archived_count ?? state.detail.archived_episodes?.length)}</span></button></div>${bulkEpisodeToolbar(filtered)}<section class="panel episode-data-panel">${episodesTable(filtered)}</section><p class="home-footnote">${icon("info")}${archived ? "보관 해제로 데이터 목록에 다시 표시할 수 있습니다. 보관은 원본 기록과 영상을 유지합니다." : "보관 아이콘은 데이터를 숨기고, 휴지통은 확인 후 episode 기록과 영상을 영구 삭제합니다."}</p><p class="home-footnote billing-note">데이터 사용 비용과 토큰 사용량은 사용 중·보관 중 episode의 합계입니다. 삭제한 episode는 집계에서 제외됩니다.</p>`;
     $("episode-filter").value = state.filter;
     updateBulkEpisodeControls();
   }
@@ -739,6 +752,7 @@
   function renderEvaluation(project) { renderLearningTab(project,true); }
 
   function renderLearningTab(project, evaluation) {
+    if (remoteRobotProject(project)) {$("tab-content").innerHTML = remoteConnectionOnlyPanel(project,evaluation ? "정책 평가" : "모델 학습");return;}
     state.modelSignature = "";state.evaluationSignature = "";state.pipelineExecutionSignature = "";
     const heading = evaluation ? "정책 평가" : "모델 학습";
     const description = evaluation ? "완료된 평가 결과를 비교하고, 정책별 rollout을 실행하세요." : "BC와 RL의 학습 설정을 확인하고 각 단계의 지표와 기록을 살펴보세요.";
@@ -751,6 +765,7 @@
   }
 
   function pipelineReadiness(stage) {
+    if (remoteRobotProject()) return {ready:false,reason:remoteConnectionOnlyReason};
     const pipeline = currentPipeline();
     const item = pipeline?.readiness?.[stage];
     if (typeof item === "boolean") return {ready:item,reason:""};
@@ -760,6 +775,7 @@
   function updatePipelineView(forceConfig = false) {
     const pipeline = currentPipeline(), project = currentProject();
     if (!project) return;
+    if (remoteRobotProject(project)) {if (state.route.tab === "collection") updateRemoteRobotConnection();return;}
     if (state.route.tab === "collection") {updateCollectionSettings();return;}
     if (state.route.tab === "overview") {
       const panel = document.querySelector(".pipeline-panel");
@@ -989,7 +1005,7 @@
     const summary = `<div class="bc-history-summary"><div><span>학습 step / 목표</span><strong>${latest ? count(latest.step) : "—"} / ${target ? count(target) : "—"}</strong><small>${progress === null ? "기록된 step 기준" : `${finiteValue(progress,1)}% · 기록된 step 기준`}</small></div><div><span>최근 Train loss</span><strong>${finiteValue(lastTrain?.train_loss,5)}</strong><small>${Number.isFinite(lastTrain?.train_loss) ? `Step ${count(lastTrain.step)}` : "관측 기록 없음"}</small></div><div><span>최근 Validation loss</span><strong>${finiteValue(lastValidation?.validation_loss,5)}</strong><small>${Number.isFinite(lastValidation?.validation_loss) ? `Step ${count(lastValidation.step)}` : "관측 기록 없음"}</small></div></div>`;
     const tabs = `<div class="bc-history-views" role="group" aria-label="학습 그래프 선택">${[["step","학습 step"],["train_loss","Train loss"],["validation_loss","Validation loss"]].map(([key,label]) => `<button id="bc-history-view-${key}" type="button" data-action="bc-history-view" data-metric="${key}" aria-pressed="${history.metric === key}" class="${history.metric === key ? "active" : ""}">${label}</button>`).join("")}</div>`;
     const reasons = {no_training:"아직 BC 학습을 실행한 기록이 없습니다.",metrics_not_found:"이 학습의 지표 로그 파일을 찾을 수 없습니다. 저장된 최종 모델 지표만으로 과거 그래프를 만들지는 않습니다.",no_metrics:"학습은 기록되었지만 아직 지표가 저장되지 않았습니다."};
-    const chart = points.length ? `${bcHistoryChart(history)}<div class="bc-history-point-controls"><label for="bc-history-point-range">기록 선택<input id="bc-history-point-range" type="range" min="0" max="${Math.max(0,points.length-1)}" step="1" value="${selected}" ${points.length<2 ? "disabled" : ""}></label><button type="button" class="button secondary small" data-action="bc-history-latest">최신 지점</button></div><div id="bc-history-point" class="bc-history-point" aria-live="polite"></div>` : `<p class="bc-history-empty">${esc(reasons[data.reason] || data.reason || "아직 기록된 학습 지표가 없습니다.")}</p>`;
+    const chart = points.length ? `${bcHistoryChart(history)}<div class="bc-history-inspector"><div id="bc-history-point" class="bc-history-point" aria-live="polite"></div><button type="button" class="button secondary small" data-action="bc-history-latest">최신 지점</button></div>` : `<p class="bc-history-empty">${esc(reasons[data.reason] || data.reason || "아직 기록된 학습 지표가 없습니다.")}</p>`;
     const checkpoints = Array.isArray(data.checkpoints) ? data.checkpoints : [], kinds = {periodic:"주기 저장",final:"학습 종료 저장",best:"검증 최상 정책"};
     const checkpointHTML = `<section class="bc-history-checkpoints"><h3>실제 저장된 체크포인트 <span class="tag neutral">${count(checkpoints.length)}</span></h3>${checkpoints.length ? `<div class="table-wrap"><table><thead><tr><th>Step</th><th>종류</th><th>파일</th><th>저장 시각</th></tr></thead><tbody>${checkpoints.map(checkpoint => `<tr><td>${Number.isFinite(checkpoint.step) ? count(checkpoint.step) : "—"}</td><td>${esc(kinds[checkpoint.kind] || checkpoint.kind || "기록 참고")}</td><td><code>${esc(checkpoint.file || "—")}</code></td><td>${checkpoint.created_at ? esc(date(checkpoint.created_at)) : "—"}</td></tr>`).join("")}</tbody></table></div>` : '<p class="field-note">이 학습에 저장된 체크포인트 기록이 없습니다.</p>'}<p class="field-note">주기·종료 체크포인트의 학습 상태와 검증 최상 policy는 구분됩니다. 저장된 파일만 표시하며 별도의 완료 모델로 계산하지 않습니다.</p></section>`;
     $("bc-history-content").innerHTML = `${summary}${tabs}${chart}<p class="bc-history-footnote">${data.sampled ? `읽은 ${count(data.total_points)}개 중 ${count(points.length)}개 관측점을 표시합니다. ` : `${count(points.length)}개 관측점. `}${data.truncated ? "로그 크기 제한으로 일부 이전 기록은 포함되지 않았습니다. " : ""}팝업이 열린 동안 이 학습 기록만 자동 갱신합니다.</p>${checkpointHTML}`;
@@ -1001,7 +1017,6 @@
     const history = state.bcHistory;if (!bcHistoryIsCurrent(history) || !history.points.length) return;
     history.selectedIndex = Math.max(0,Math.min(history.points.length-1,index));history.followLatest = followLatest;
     const point = history.points[history.selectedIndex], chart = history.chart;
-    if ($("bc-history-point-range")) $("bc-history-point-range").value = String(history.selectedIndex);
     if ($("bc-history-point")) $("bc-history-point").innerHTML = `<strong>Step ${count(point.step)}</strong><span>Train loss ${finiteValue(point.train_loss,6)}</span><span>Validation loss ${finiteValue(point.validation_loss,6)}</span><time>${point.time === null ? "시각 기록 없음" : esc(date(point.time))}</time>`;
     if (!chart || !$("bc-history-cursor")) return;
     const xValue = chart.timeView ? point.time === null ? null : point.time-chart.firstTime : point.step;
@@ -1056,6 +1071,7 @@
   }
 
   function pipelineStartBlockedReason() {
+    if (remoteRobotProject()) return remoteConnectionOnlyReason;
     const pipeline = currentPipeline(), runtime = pipelineRuntime();
     if (!state.connected) return "서버 연결을 확인해주세요.";
     if (!pipeline?.config || pipeline.unavailable) return "파이프라인 설정을 불러온 뒤 다시 시도해주세요.";
@@ -1256,6 +1272,7 @@
   }
 
   async function refreshPipeline(force = false) {
+    if (remoteRobotProject()) return;
     const id = state.route.id, token = state.routeToken;
     if (!id || state.pipelineBusy && !force || !force && !["overview","models","evaluation","collection"].includes(state.route.tab)) return;
     if (!force && !pipelineEnabled()) return;
@@ -1274,6 +1291,7 @@
   }
 
   async function pipelineCommand(action, payload = {}, projectId = state.route.id) {
+    if (projectId === state.route.id && remoteRobotProject()) {toast(remoteConnectionOnlyReason,true);return;}
     if (!projectId || (action === "pause" ? state.pipelinePausePending : state.pipelinePending)) return;
     if (action === "start" && (payload.mode === "auto" ? state.route.tab !== "overview" : !["models","evaluation"].includes(state.route.tab) || !manualPipelineStages().some(stage => stage.id === payload.stage))) return;
     if (action === "start" && payload.mode === "auto" && currentPipeline()?.auto_plan?.complete) {toast("모든 목표를 달성했습니다. 추가 실행이 필요하지 않습니다.");return;}
@@ -1293,15 +1311,90 @@
 
   const numericField = (name, label, value, min, max, unit = "", step = 1) => `<label class="field">${esc(label)}<div class="input-unit${unit === "$" ? " currency-prefix" : ""}">${unit === "$" ? "<span>$</span>" : ""}<input name="${name}" type="number" min="${min}" max="${max}" step="${step}" required value="${n(value)}">${unit && unit !== "$" ? `<span>${esc(unit)}</span>` : ""}</div></label>`;
 
+  function updateProjectManagement() {
+    const project = currentProject();
+    if (!project || !$("project-archive")) return;
+    const busy = Boolean(state.projectMutation || state.settingsSaving);
+    const reason = project.manage_disabled_reason || "";
+    const archive = $("project-archive"), remove = $("project-delete");
+    archive.dataset.action = project.archived ? "restore-project" : "archive-project";
+    archive.innerHTML = `${icon(project.archived ? "restore" : "archive")}${project.archived ? "프로젝트 복원" : "프로젝트 보관"}`;
+    archive.disabled = busy || !state.connected || project.can_archive !== true;
+    remove.disabled = busy || !state.connected || project.can_delete !== true;
+    remove.innerHTML = `${icon("trash")}${project.delete_pending ? "삭제 재시도" : "프로젝트 삭제"}`;
+    archive.title = remove.title = reason;
+    $("project-management-note").textContent = reason || (project.archived
+      ? "보관된 프로젝트입니다. 복원하면 다시 수집·학습할 수 있습니다."
+      : "보관한 프로젝트는 워크스페이스 보관함에서 복원할 수 있습니다.");
+    if ($("settings-save")) $("settings-save").disabled = busy || Boolean(project.delete_pending);
+  }
+
+  async function archiveProject(archived) {
+    const project = currentProject(), token = state.routeToken;
+    if (!project || project.can_archive !== true || state.projectMutation || state.settingsSaving) return;
+    state.projectMutation = {projectId:project.id,action:"archive"};
+    updateProjectManagement();
+    try {
+      const result = await api(`/api/projects/${encodeURIComponent(project.id)}/archive`,{archived});
+      if (token === state.routeToken && currentProject()?.id === project.id) {
+        if (archived) {state.projectView = "archived";location.hash = "#/";}
+        else {state.detail = result;renderProject();}
+      }
+      toast(archived ? "프로젝트를 보관했습니다. 워크스페이스 보관함에서 복원할 수 있습니다." : "프로젝트를 복원했습니다.");
+      await refreshWorkspace(true);
+    } catch (error) {
+      toast(error.message,true);
+      if (token === state.routeToken) await loadDetail(false);
+    } finally {state.projectMutation = null;updateProjectManagement();}
+  }
+
+  function askDeleteProject() {
+    const project = currentProject();
+    if (!project || project.can_delete !== true || state.projectMutation || state.settingsSaving) return;
+    state.projectDeleteTarget = {id:project.id,name:project.name};
+    $("project-delete-name").textContent = project.name;
+    $("project-delete-error").hidden = true;
+    $("project-delete-confirm").disabled = false;
+    $("project-delete-dialog").showModal();
+  }
+
+  async function deleteProject() {
+    const target = state.projectDeleteTarget;
+    if (!target || state.projectMutation || state.settingsSaving) return;
+    state.projectMutation = {projectId:target.id,action:"delete"};
+    $("project-delete-confirm").disabled = true;
+    $("project-delete-error").hidden = true;
+    updateProjectManagement();
+    try {
+      await api(`/api/projects/${encodeURIComponent(target.id)}/delete`,{confirm:true},120000);
+      $("project-delete-dialog").close();
+      if (state.route.id === target.id) {
+        state.detail = null;state.detailSignature = "";state.pipeline = null;state.pipelineProjectId = null;
+        location.hash = "#/";
+      }
+      toast("프로젝트와 해당 프로젝트의 데이터를 삭제했습니다.");
+      await refreshWorkspace(true);
+    } catch (error) {
+      $("project-delete-error").textContent = error.message;
+      $("project-delete-error").hidden = false;
+      if (state.route.id === target.id) await loadDetail(false);
+    } finally {
+      state.projectMutation = null;
+      $("project-delete-confirm").disabled = false;
+      updateProjectManagement();
+    }
+  }
+
   function renderSettings(project) {
     const selected = nextPolicy(project);
     const models = policyOptions().models || [];
     const known = models.some(item => item.model === selected.model);
     const modelChoices = `${known ? "" : `<option value="${esc(selected.model || "")}">${esc(selected.model || "서버 기본값")} · 서버 설정</option>`}${models.map(item => `<option value="${esc(item.model)}">${esc(item.label || item.model)}</option>`).join("")}`;
-    $("tab-content").innerHTML = `<form id="settings-form" class="settings-layout"><section class="panel settings-section"><div class="panel-header"><div><h2>프로젝트 정보</h2><p>Task별 데이터와 실행을 구분하는 이름과 설명</p></div></div><div class="panel-body"><div class="form-grid"><label class="field full">프로젝트 이름<input name="name" required maxlength="120" value="${esc(project.name)}"></label><label class="field full">설명<textarea name="description" rows="2" maxlength="2000">${esc(project.description || "")}</textarea></label></div></div></section><section class="panel settings-section"><div class="panel-header"><div><h2>GPT 모델 설정</h2><p>이 프로젝트의 데이터 수집과 reset에 사용할 모델</p></div>${tag("프로젝트별 설정","success")}</div><div class="panel-body"><div class="form-grid"><label class="field">추론 모델<select id="policy-model" name="policy_model" required>${modelChoices}</select></label><label class="field">추론 수준<select id="policy-effort" name="reasoning_effort" required></select></label></div><div id="policy-run-status" class="policy-run-status"></div><p class="field-note">저장 후 다음 <strong>새 run 시작</strong>부터 적용됩니다. 환경을 다시 연결할 필요는 없습니다. 시작한 run은 Pause·재개 시에도 기존 모델·추론 수준을 유지합니다.</p><p id="policy-model-note" class="field-note"></p></div></section>${graspBaselinePanel(project)}<p id="settings-error" class="form-error" role="alert" hidden></p><div class="settings-actions"><p>환경 재연결 없이 다음 새 run에 적용됩니다. 진행 중인 run은 기존 설정을 유지합니다.</p><button id="settings-save" class="button primary" type="submit">${icon("check")}설정 저장</button></div></form>`;
+    $("tab-content").innerHTML = `<form id="settings-form" class="settings-layout"><section class="panel settings-section"><div class="panel-header"><div><h2>프로젝트 정보</h2><p>Task별 데이터와 실행을 구분하는 이름과 설명</p></div></div><div class="panel-body"><div class="form-grid"><label class="field full">프로젝트 이름<input name="name" required maxlength="120" value="${esc(project.name)}"></label><label class="field full">설명<textarea name="description" rows="2" maxlength="2000">${esc(project.description || "")}</textarea></label></div></div></section><section class="panel settings-section"><div class="panel-header"><div><h2>GPT 모델 설정</h2><p>이 프로젝트의 데이터 수집과 reset에 사용할 모델</p></div>${tag("프로젝트별 설정","success")}</div><div class="panel-body"><div class="form-grid"><label class="field">추론 모델<select id="policy-model" name="policy_model" required>${modelChoices}</select></label><label class="field">추론 수준<select id="policy-effort" name="reasoning_effort" required></select></label></div><div id="policy-run-status" class="policy-run-status"></div><p class="field-note">저장 후 다음 <strong>새 run 시작</strong>부터 적용됩니다. 환경을 다시 연결할 필요는 없습니다. 시작한 run은 Pause·재개 시에도 기존 모델·추론 수준을 유지합니다.</p><p id="policy-model-note" class="field-note"></p></div></section>${remoteRobotProject(project) ? "" : graspBaselinePanel(project)}<p id="settings-error" class="form-error" role="alert" hidden></p><div class="settings-actions"><div class="settings-action-notes"><p>환경 재연결 없이 다음 새 run에 적용됩니다. 진행 중인 run은 기존 설정을 유지합니다.</p><p id="project-management-note" class="field-note"></p></div><div class="settings-action-buttons"><button id="project-archive" class="button secondary" type="button" data-action="archive-project">${icon("archive")}프로젝트 보관</button><button id="project-delete" class="button danger" type="button" data-action="delete-project">${icon("trash")}프로젝트 삭제</button><button id="settings-save" class="button primary" type="submit">${icon("check")}설정 저장</button></div></div></form>`;
     $("policy-model").value = selected.model || "";
     updatePolicyEfforts(selected.reasoning_effort);
     updatePolicyStatus();
+    updateProjectManagement();
   }
 
   function updatePolicyEfforts(preferred = $("policy-effort")?.value) {
@@ -1324,14 +1417,662 @@
     if (selected.reasoning_effort === "auto") holder.insertAdjacentHTML("beforeend",'<p>Auto는 medium으로 시작합니다. GPT가 정밀 조작·접촉 불확실성·실패 복구를 판단하면 동작 없이 xhigh로 다시 판단하고, 안정화되면 다음 요청부터 medium으로 돌아갑니다. 재판단도 GPT 호출 수와 비용에 포함됩니다.</p>');
   }
 
+  function remoteConnectionOnlyPanel(project, title) {
+    return `<section class="panel remote-connection-only"><div class="panel-header"><div><h2>${esc(title)}</h2><p>SSH 연결과 로봇 client 실행을 별도로 관리합니다.</p></div>${tag("원격 client")}</div><div class="panel-body"><p>${esc(remoteConnectionOnlyReason)}</p><p class="field-note">서버 별명·사용자·IP/호스트·포트를 직접 입력합니다. 설정 저장과 연결은 각각 명시적으로 요청합니다.</p><a class="button primary" href="${routeUrl(project.id,"collection")}">${icon("terminal")}SSH 연결 설정</a></div></section>`;
+  }
+
+  function robotConnectionIsCurrent(session = state.robotConnection) {
+    return Boolean(session && state.robotConnection === session && session.projectId === state.route.id && session.routeToken === state.routeToken && state.route.tab === "collection" && remoteRobotProject());
+  }
+
+  function stopRobotConnectionPolling() {
+    const session = state.robotConnection;
+    if (session) {clearTimeout(session.timer);session.controller?.abort();if (session.draft) session.draft.password = "";}
+    if ($("robot-password")) $("robot-password").value = "";
+    if ($("robot-host-key-dialog")?.open) $("robot-host-key-dialog").close();
+    state.robotHostKey = null;
+    state.robotConnection = null;
+  }
+
+  function robotConnectionError(message, code) {
+    const help = {
+      host_key:"호스트 키 확인 버튼에서 지문을 확인하고 등록한 뒤 다시 연결해주세요.",
+      authentication:"입력한 사용자와 선택한 인증 방법의 비밀번호 또는 키를 확인해주세요.",
+      timeout:"SSH 대상 주소와 네트워크 연결을 확인한 뒤 다시 시도해주세요.",
+      unreachable:"대상 PC가 켜져 있는지, SSH 주소·포트와 네트워크가 올바른지 확인해주세요.",
+      unsupported_os:"현재 연결 기능이 지원하는 원격 PC 운영체제를 확인해주세요.",
+      protocol:"원격 PC의 SSH 응답 형식을 확인할 수 없습니다. 사용자·호스트·포트를 확인해주세요.",
+      ssh_unavailable:"RILO 서버를 실행하는 PC에서 SSH 명령을 사용할 수 있는지 확인해주세요.",
+      identity_file:"선택한 인증 키 파일이 RILO 컴퓨터에 있는지, 서버 실행 계정이 읽을 수 있는지 확인해주세요.",
+      process_exit:"SSH 연결이 종료되었습니다. 연결 설정을 확인한 뒤 다시 연결할 수 있습니다."
+    };
+    const text = typeof message === "string" ? message : "";
+    return help[code] ? `${help[code]}${text ? ` ${text}` : ""}` : text;
+  }
+
+  function robotConnectionConfig(value = {}) {
+    const method = value?.auth_method || "password";
+    return {name:String(value?.name ?? "").trim(),username:String(value?.username ?? "").trim(),host:String(value?.host ?? "").trim(),port:Number(value?.port ?? 22),auth_method:method,remember_password:method === "password" && value?.remember_password === true,identity_file:method === "key" ? String(value?.identity_file ?? "").trim() || null : null};
+  }
+
+  function robotConnectionConfigError(config) {
+    if (!config.name || config.name.length>120 || /[\x00-\x1f\x7f]/.test(config.name)) return "표시용 서버 별명을 1~120자로 입력해주세요.";
+    if (!config.username || config.username.length>64 || !/^[A-Za-z0-9_][A-Za-z0-9_.-]*\$?$/.test(config.username)) return "사용자는 영문·숫자·밑줄로 시작하는 계정 이름으로 입력해주세요. 최대 64자이며 끝의 $는 사용할 수 있습니다.";
+    const host = config.host;
+    if (!host || host.length>253 || (host.includes(":") ? (host.match(/:/g) || []).length<2 || !/^[0-9a-fA-F:.]+$/.test(host) : !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(host))) return "IP 또는 실제 호스트명을 입력해주세요. 사용자@호스트, URL, 공백과 포트 접미사는 사용할 수 없습니다. 포트는 별도 입력란에 지정하세요.";
+    if (!Number.isInteger(config.port) || config.port<1 || config.port>65535) return "포트는 1~65535 사이의 정수로 입력해주세요.";
+    if (!["password","key"].includes(config.auth_method)) return "비밀번호 또는 키 인증을 선택해주세요.";
+    if (config.identity_file && (config.identity_file.length>4096 || !config.identity_file.startsWith("/") && !config.identity_file.startsWith("~/") || config.identity_file.includes("${") || /[%\x00-\x1f\x7f]/.test(config.identity_file))) return "인증 키 경로는 4096자 이내의 절대 경로 또는 ~/로 시작하는 경로로 입력해주세요. 변수 토큰이나 % 토큰, 제어 문자는 사용할 수 없습니다.";
+    return "";
+  }
+
+  function robotConnectionDestination(config) {
+    if (!config?.username || !config?.host) return "";
+    return `${config.username}@${config.host.includes(":") ? `[${config.host}]` : config.host}:${config.port}`;
+  }
+
+  function robotConnectionChanged(session) {
+    const config = robotConnectionConfig(session.draft), saved = session.data?.config ? robotConnectionConfig(session.data.config) : null;
+    return !saved || JSON.stringify(config) !== JSON.stringify(saved) || config.auth_method === "password" && Boolean(session.draft.password);
+  }
+
+  function editRobotConnectionField(input) {
+    const key = input.dataset?.robotConfig;
+    if (!["name","username","host","port","auth_method","remember_password","identity_file","password"].includes(key) || !robotConnectionIsCurrent()) return;
+    const session = state.robotConnection;
+    session.draft[key] = key === "remember_password" ? input.checked : input.value;
+    if (key === "auth_method" && input.value === "key") {session.draft.password = "";session.draft.remember_password = false;}
+    session.dirty = true;session.error = null;updateRemoteRobotConnection();
+  }
+
+  function renderRemoteRobotConnection(project) {
+    if (!robotConnectionIsCurrent()) {
+      stopRobotConnectionPolling();
+      state.robotConnection = {projectId:project.id,routeToken:state.routeToken,data:null,draft:robotConnectionConfig(),dirty:false,error:null,stale:false,busy:false,request:0,timer:null,controller:null};
+    }
+    const session = state.robotConnection, draft = session.draft;
+    $("tab-content").innerHTML = `<section class="panel robot-connection-panel"><div class="panel-header"><div><h2>로봇 PC SSH 연결</h2><p>접속 정보를 직접 입력합니다. SSH config는 불러오지 않습니다.</p></div><span id="robot-connection-state" class="tag neutral">상태 확인 중</span></div><div class="panel-body"><p class="robot-connection-scope">SSH는 원격 PC 접속과 상태를 확인합니다. 로봇 관측·정책 실행은 아래 로봇 client 패널에서 별도로 연결합니다.</p><form id="robot-connection-form"><fieldset id="robot-connection-fields" class="robot-connection-config"><label class="field robot-server-name-field">서버 별명<input id="robot-server-name" name="name" data-robot-config="name" required maxlength="120" autocomplete="off" placeholder="예: 실험실 로봇 PC" value="${esc(draft.name)}"><small>화면에 표시할 이름입니다. 접속 주소로 사용하지 않습니다.</small></label><label class="field">사용자<input id="robot-username" name="username" data-robot-config="username" required maxlength="64" autocomplete="off" spellcheck="false" placeholder="예: seunghyo" value="${esc(draft.username)}"></label><label class="field">IP / 호스트<input id="robot-host" name="host" data-robot-config="host" required maxlength="253" autocomplete="off" spellcheck="false" placeholder="예: 192.168.0.10" value="${esc(draft.host)}"><small>실제 호스트명·IPv4·IPv6 주소를 입력하세요.</small></label><label class="field robot-port-field">포트<input id="robot-port" name="port" data-robot-config="port" type="number" required min="1" max="65535" step="1" value="${esc(draft.port)}"></label><label class="field robot-auth-method-field">인증 방법<select id="robot-auth-method" name="auth_method" data-robot-config="auth_method"><option value="password" ${draft.auth_method !== "key" ? "selected" : ""}>비밀번호</option><option value="key" ${draft.auth_method === "key" ? "selected" : ""}>SSH 키</option></select></label><div id="robot-password-fields" class="robot-password-fields"><label class="field">비밀번호<input id="robot-password" name="password" data-robot-config="password" type="password" autocomplete="current-password" spellcheck="false" placeholder="저장된 비밀번호는 다시 표시하지 않습니다"></label><label class="robot-remember-option"><input id="robot-remember-password" name="remember_password" data-robot-config="remember_password" type="checkbox" ${draft.remember_password ? "checked" : ""}><span>.env에 비밀번호 저장</span></label><p class="field-note">선택하면 artifacts/robot_ssh/.env에 비밀번호를 평문으로 저장하며 현재 계정만 읽을 수 있습니다. 선택하지 않으면 현재 RILO 서버가 종료될 때까지 사용하고, 재시작 후에는 다시 입력합니다.</p><p id="robot-password-state" class="field-note" role="status"></p></div><label id="robot-identity-field" class="field robot-identity-field">인증 키 경로 <span class="optional">선택</span><input id="robot-identity-file" name="identity_file" data-robot-config="identity_file" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="예: ~/.ssh/id_ed25519" value="${esc(draft.identity_file || "")}"><small>RILO가 실행되는 컴퓨터의 키 파일 경로입니다. 비워두면 기본 키 또는 ssh-agent를 사용합니다. 키 내용이나 비밀번호를 입력하지 마세요.</small></label></fieldset><div class="robot-config-actions"><p id="robot-config-note" class="field-note" role="status"></p><button id="robot-config-save" type="submit" class="button secondary" disabled>${icon("check")}설정 저장</button></div><p id="robot-legacy-note" class="field-note" role="status" hidden></p></form><div class="robot-connection-actions"><button id="robot-host-key-check" type="button" class="button secondary" data-action="robot-host-key-check" disabled>${icon("check")}호스트 키 확인</button><button id="robot-connect" type="button" class="button primary" data-action="robot-connect" disabled>${icon("terminal")}SSH 연결</button><button id="robot-disconnect" type="button" class="button danger" data-action="robot-disconnect" disabled>${icon("close")}연결 해제</button><button id="robot-status-refresh" type="button" class="button secondary" data-action="robot-status-refresh" disabled>${icon("reset")}상태 확인</button></div><p id="robot-connection-note" class="field-note" role="status"></p><p id="robot-connection-owner" class="field-note" role="status" hidden></p><p id="robot-connection-error" class="form-error" role="alert" hidden></p><section class="robot-host-section"><h3 id="robot-host-heading">연결된 PC 정보</h3><dl class="robot-host-info"><div><dt>서버 별명</dt><dd id="robot-saved-name">—</dd></div><div><dt>접속 대상</dt><dd id="robot-destination">—</dd></div><div><dt>Hostname</dt><dd id="robot-host-name">—</dd></div><div><dt>사용자</dt><dd id="robot-host-user">—</dd></div><div><dt>운영체제</dt><dd id="robot-host-os">—</dd></div><div><dt>Architecture</dt><dd id="robot-host-arch">—</dd></div><div><dt>연결 시각</dt><dd id="robot-connected-at">—</dd></div><div><dt>최근 연결 확인</dt><dd id="robot-last-heartbeat">—</dd></div></dl></section><p class="field-note">화면을 이동해도 SSH 연결은 유지됩니다. 연결을 끝내려면 연결 해제를 누르세요.</p></div></section>`;
+    $("tab-content").insertAdjacentHTML("beforeend",renderRemotePolicyPanel(project));
+    updateRemoteRobotConnection();refreshRobotConnection();updateRemotePolicyPanel();refreshRemotePolicy();
+  }
+
+  function updateRemoteRobotConnection() {
+    const session = state.robotConnection;
+    if (!robotConnectionIsCurrent(session) || !$("robot-connection-fields")) return;
+    const response = session.data, status = response?.status || {}, phase = status.phase || "disconnected";
+    const active = response?.active_connection, held = Boolean(active?.project_id);
+    const other = held && active.project_id !== session.projectId;
+    const ownActive = held && !other || ["connecting","connected","disconnecting"].includes(phase);
+    const mutation = state.robotConnectionMutation || state.remotePolicyMutation, pending = mutation?.projectId === session.projectId ? mutation.action : null;
+    const managedClient = remotePolicyIsCurrent() && (remoteLauncherHeld(state.remotePolicy) || remoteRunActive(state.remotePolicy.data?.run));
+    const config = robotConnectionConfig(session.draft), saved = response?.config ? robotConnectionConfig(response.config) : null;
+    const configured = Boolean(saved && !robotConnectionConfigError(saved));
+    const unavailable = !state.connected || !response || session.stale, changed = robotConnectionChanged(session);
+    const phases = {disconnected:"SSH 연결 안 됨",connecting:"SSH 연결 중",connected:"SSH 연결됨",disconnecting:"연결 해제 중",error:"연결 확인 필요"};
+    $("robot-connection-state").textContent = response && (session.stale || !state.connected) ? "상태 확인 필요" : response ? phases[phase] || phase : "상태 확인 중";
+    $("robot-connection-state").className = `tag ${session.stale ? "warning" : phase === "connected" && state.connected ? "success" : phase === "error" ? "warning" : "neutral"}`;
+    $("robot-connection-fields").disabled = Boolean(unavailable || ownActive || pending);
+    for (const [id,key] of [["robot-server-name","name"],["robot-username","username"],["robot-host","host"],["robot-port","port"],["robot-auth-method","auth_method"],["robot-identity-file","identity_file"]]) {
+      $(id).disabled = Boolean(unavailable || ownActive || pending);
+      if (!session.dirty) $(id).value = String(session.draft[key] ?? "");
+    }
+    const passwordMode = config.auth_method === "password";
+    $("robot-password-fields").hidden = !passwordMode;$("robot-identity-field").hidden = passwordMode;
+    $("robot-password").disabled = Boolean(unavailable || ownActive || pending || !passwordMode);
+    $("robot-remember-password").disabled = $("robot-password").disabled;
+    $("robot-identity-file").disabled = Boolean(unavailable || ownActive || pending || passwordMode);
+    if ($("robot-password").value !== (session.draft.password || "")) $("robot-password").value = session.draft.password || "";
+    $("robot-remember-password").checked = config.remember_password;
+    const credentials = response?.credentials || {}, passwordReady = credentials.password_available === true;
+    $("robot-password-state").textContent = credentials.password_saved ? "저장된 접속 대상의 비밀번호가 전용 .env에 저장되어 있습니다. 비밀번호는 다시 표시하지 않습니다." : passwordReady ? "저장된 접속 대상의 비밀번호를 현재 RILO 서버에서 사용할 수 있습니다. 서버 재시작 후에는 다시 입력해야 합니다." : "저장된 비밀번호가 없습니다. 입력한 뒤 설정 저장을 누르면 연결에 사용할 수 있습니다.";
+    $("robot-config-save").disabled = Boolean(unavailable || ownActive || mutation || !changed);
+    $("robot-config-save").innerHTML = icon("check")+(pending === "config" ? "저장 중…" : "설정 저장");
+    $("robot-config-note").textContent = ownActive ? "접속 정보 변경은 이 프로젝트의 연결을 해제한 뒤 저장하세요." : changed && session.dirty ? "저장하지 않은 변경이 있습니다. 설정을 저장한 뒤 연결할 수 있습니다." : configured ? "저장된 접속 정보입니다. 저장만으로 SSH 연결을 시작하지 않습니다." : "서버 별명·사용자·IP/호스트·포트를 입력하고 설정을 저장하세요.";
+    $("robot-legacy-note").hidden = Boolean(response?.config || !response?.legacy_name);
+    $("robot-legacy-note").textContent = response?.legacy_name ? `이전 별칭 '${response.legacy_name}'은 서버 별명 힌트로만 표시합니다. SSH config를 불러오지 않으므로 사용자·IP/호스트·포트를 새로 입력하고 저장해주세요.` : "";
+    $("robot-connect").disabled = Boolean(unavailable || mutation || ownActive || other || changed || !configured || saved?.auth_method === "password" && !passwordReady || response?.capabilities?.ssh === false);
+    $("robot-connect").innerHTML = icon("terminal")+(pending === "connect" || phase === "connecting" ? "SSH 연결 중…" : phase === "connected" ? "SSH 연결됨" : "SSH 연결");
+    $("robot-disconnect").disabled = Boolean(unavailable || mutation || managedClient || !ownActive || phase === "disconnecting");
+    $("robot-disconnect").title = managedClient ? "아래 client 패널에서 run을 중지한 뒤 환경 연결을 해제하세요." : "";
+    $("robot-disconnect").innerHTML = icon("close")+(pending === "disconnect" || phase === "disconnecting" ? "연결 해제 중…" : ownActive && phase === "error" ? "연결 해제 다시 시도" : "연결 해제");
+    $("robot-host-key-check").disabled = Boolean(unavailable || mutation || ownActive || held || changed || !configured);
+    $("robot-host-key-check").innerHTML = icon("check")+(pending === "host-key" ? "호스트 키 확인 중…" : "호스트 키 확인");
+    $("robot-status-refresh").disabled = Boolean(session.busy || mutation);
+    const notes = {disconnected:"SSH 연결 버튼을 누르면 저장한 접속 정보로 연결합니다. 상태 확인은 새 연결을 만들지 않습니다.",connecting:"SSH 인증과 대상 PC 정보를 확인하고 있습니다. 로봇 동작은 실행하지 않습니다.",connected:"SSH 연결과 PC 정보 확인이 완료되었습니다. 로봇 관측·실행 상태는 아래 client 패널에서 확인하세요.",disconnecting:"이 프로젝트의 SSH 연결을 해제하고 있습니다.",error:"연결 오류를 확인한 뒤 다시 연결할 수 있습니다."};
+    $("robot-connection-note").textContent = !state.connected ? "RILO 서버 연결을 확인해주세요." : notes[phase] || "SSH 연결 상태를 확인하고 있습니다.";
+    $("robot-connection-owner").hidden = !other;
+    if (other) {
+      const owner = state.workspace?.projects?.find(project => project.id === active.project_id)?.name || active.project_id;
+      $("robot-connection-owner").innerHTML = `다른 프로젝트 <a href="${routeUrl(active.project_id,"collection")}">${esc(owner)}</a>의 ${esc(active.name || "원격 서버")}${active.destination ? ` (${esc(active.destination)})` : ""} 연결이 아직 종료되지 않았습니다. 해당 프로젝트에서 연결을 해제한 뒤 연결하세요.`;
+    }
+    const error = session.error || robotConnectionError(status.error,status.error_code);
+    $("robot-connection-error").textContent = error || "";$("robot-connection-error").hidden = !error;
+    const host = status.host_info || {};
+    $("robot-host-heading").textContent = phase === "connected" && !unavailable ? "연결된 PC 정보" : "최근 확인된 PC 정보";
+    for (const [id,value] of [["robot-saved-name",status.name || response?.config?.name],["robot-destination",status.destination || robotConnectionDestination(saved)],["robot-host-name",host.hostname],["robot-host-user",host.user],["robot-host-os",host.os],["robot-host-arch",host.arch]]) $(id).textContent = value || "—";
+    $("robot-connected-at").textContent = status.connected_at ? date(status.connected_at,{second:"2-digit"}) : "—";
+    $("robot-last-heartbeat").textContent = status.last_heartbeat_at ? date(status.last_heartbeat_at,{second:"2-digit"}) : "—";
+    updateRobotHostKeyDialog();
+  }
+
+  function installRobotConnectionResponse(session, response) {
+    if (response.project_id !== session.projectId) throw new Error("다른 프로젝트의 SSH 상태 응답을 무시했습니다.");
+    session.data = response;session.error = null;session.stale = false;
+    if (!session.dirty) session.draft = robotConnectionConfig(response.config || {name:String(response.legacy_name || "").slice(0,120)});
+  }
+
+  function scheduleRobotConnectionRefresh(session) {
+    clearTimeout(session.timer);
+    if (robotConnectionIsCurrent(session)) session.timer = setTimeout(refreshRobotConnection,2500);
+  }
+
+  async function refreshRobotConnection() {
+    const session = state.robotConnection;if (!robotConnectionIsCurrent(session) || session.busy) return;
+    if (state.robotConnectionMutation?.projectId === session.projectId) {scheduleRobotConnectionRefresh(session);return;}
+    clearTimeout(session.timer);session.busy = true;const request = ++session.request;
+    session.controller = new AbortController();updateRemoteRobotConnection();
+    try {
+      const response = await api(`/api/projects/${encodeURIComponent(session.projectId)}/robot-connection`,undefined,10000,session.controller.signal);
+      if (!robotConnectionIsCurrent(session) || request !== session.request) return;
+      installRobotConnectionResponse(session,response);
+    } catch (error) {
+      if (robotConnectionIsCurrent(session) && request === session.request) {session.stale = true;session.error = error.status === 404 && error.detail === "Not Found" ? "현재 서버에 SSH 연결 기능이 반영되지 않았습니다. RILO 서버를 재시작한 뒤 새로고침해주세요." : error.message;}
+    } finally {
+      if (request === session.request) {session.busy = false;session.controller = null;if (robotConnectionIsCurrent(session)) {updateRemoteRobotConnection();scheduleRobotConnectionRefresh(session);}}
+    }
+  }
+
+  async function robotConnectionCommand(action, event) {
+    event?.preventDefault();const session = state.robotConnection;
+    if (!robotConnectionIsCurrent(session) || state.robotConnectionMutation || state.remotePolicyMutation || !state.connected || !session.data || session.stale || !["config","connect","disconnect"].includes(action)) return;
+    const status = session.data.status || {}, active = session.data.active_connection;
+    const other = Boolean(active?.project_id) && active.project_id !== session.projectId;
+    const ownActive = Boolean(active?.project_id) && !other || ["connecting","connected","disconnecting"].includes(status.phase);
+    const config = robotConnectionConfig(session.draft), saved = session.data.config ? robotConnectionConfig(session.data.config) : null;
+    const configured = Boolean(saved && !robotConnectionConfigError(saved)), changed = robotConnectionChanged(session);
+    if (action === "disconnect" && remotePolicyIsCurrent() && (remoteLauncherHeld(state.remotePolicy) || remoteRunActive(state.remotePolicy.data?.run))) return;
+    if (action === "config") {
+      if (ownActive) return;
+      if (!$("robot-connection-form").reportValidity()) return;
+      const error = robotConnectionConfigError(config);
+      if (error) {session.error = error;updateRemoteRobotConnection();return;}
+      if (!changed) return;
+    }
+    if (action === "connect" && (ownActive || other || !configured || changed || saved?.auth_method === "password" && session.data.credentials?.password_available !== true || session.data.capabilities?.ssh === false)) return;
+    if (action === "disconnect" && (!ownActive || status.phase === "disconnecting")) return;
+    session.controller?.abort();session.controller = null;session.request += 1;session.busy = false;clearTimeout(session.timer);
+    const payload = action === "config" ? {...config} : {};
+    if (action === "config" && config.auth_method === "password" && session.draft.password) payload.password = session.draft.password;
+    const mutation = {projectId:session.projectId,action};state.robotConnectionMutation = mutation;session.error = null;updateRemoteRobotConnection();
+    try {
+      const response = await api(`/api/projects/${encodeURIComponent(session.projectId)}/robot-connection/${action}`,payload,30000);
+      if (!robotConnectionIsCurrent(session)) return;
+      if (response.project_id !== session.projectId) throw new Error("다른 프로젝트의 SSH 상태 응답을 무시했습니다.");
+      if (action === "config") {session.dirty = false;session.draft = {...robotConnectionConfig(response.config || config),password:""};$("robot-password").value = "";}
+      installRobotConnectionResponse(session,response);
+      toast(action === "config" ? "SSH 설정을 저장했습니다. 연결은 아직 시작하지 않았습니다." : action === "connect" ? "SSH 연결을 요청했습니다." : "SSH 연결 해제를 요청했습니다.");
+    } catch (error) {
+      if (robotConnectionIsCurrent(session)) {session.stale = true;session.error = error.status === 404 && error.detail === "Not Found" ? "현재 서버에 SSH 연결 기능이 반영되지 않았습니다. RILO 서버를 재시작한 뒤 새로고침해주세요." : robotConnectionError(error.message,error.detail?.code);}
+    } finally {
+      if (Object.hasOwn(payload,"password")) delete payload.password;
+      if (state.robotConnectionMutation === mutation) state.robotConnectionMutation = null;
+      if (robotConnectionIsCurrent(session)) {updateRemoteRobotConnection();scheduleRobotConnectionRefresh(session);}
+      else if (robotConnectionIsCurrent()) updateRemoteRobotConnection();
+    }
+  }
+
+  function robotHostKeyBlockReason(session = state.robotConnection) {
+    if (!robotConnectionIsCurrent(session) || !state.connected || !session.data || session.stale) return "연결 상태를 다시 확인해주세요.";
+    if (state.remotePolicyMutation || remotePolicyIsCurrent() && remoteLauncherHeld(state.remotePolicy)) return "Client 환경 연결을 해제한 뒤 호스트 키를 확인해주세요.";
+    if (!session.data.config || robotConnectionConfigError(robotConnectionConfig(session.data.config))) return "접속 정보를 먼저 저장해주세요.";
+    if (robotConnectionChanged(session)) return "변경한 접속 정보를 저장한 뒤 호스트 키를 다시 확인해주세요.";
+    if (session.data.active_connection || ["connecting","connected","disconnecting"].includes(session.data.status?.phase)) return "진행 중인 SSH 연결을 해제한 뒤 호스트 키를 확인할 수 있습니다.";
+    return "";
+  }
+
+  function updateRobotHostKeyDialog() {
+    const pending = state.robotHostKey;
+    if (!pending || !$("robot-host-key-dialog")?.open) return;
+    const session = state.robotConnection;
+    const changed = !robotConnectionIsCurrent(session) || session.projectId !== pending.projectId || session.routeToken !== pending.routeToken || JSON.stringify(robotConnectionConfig(session.data?.config)) !== pending.configSignature;
+    const reason = changed ? "접속 정보가 변경되었습니다. 창을 닫고 호스트 키를 다시 확인해주세요." : pending.invalid ? "키 확인 정보가 만료되거나 변경되었습니다. 창을 닫고 다시 확인해주세요." : robotHostKeyBlockReason(session);
+    $("robot-host-key-trust").disabled = Boolean(pending.busy || state.robotConnectionMutation || state.remotePolicyMutation || reason);
+    $("robot-host-key-trust").textContent = pending.busy ? "호스트 키 등록 중…" : "확인한 호스트 키 등록";
+    $("robot-host-key-note").textContent = reason || "등록만으로 SSH 연결을 시작하지 않습니다. 연결은 별도 버튼으로 요청하세요.";
+  }
+
+  async function checkRobotHostKey() {
+    const session = state.robotConnection;
+    if (!robotConnectionIsCurrent(session) || state.robotConnectionMutation || state.remotePolicyMutation || $("robot-host-key-dialog").open) return;
+    const reason = robotHostKeyBlockReason(session);
+    if (reason) {session.error = reason;updateRemoteRobotConnection();return;}
+    const configSignature = JSON.stringify(robotConnectionConfig(session.data.config));
+    session.controller?.abort();session.controller = null;session.request += 1;session.busy = false;clearTimeout(session.timer);
+    const mutation = {projectId:session.projectId,action:"host-key"};state.robotConnectionMutation = mutation;session.error = null;updateRemoteRobotConnection();
+    try {
+      const result = await api(`/api/projects/${encodeURIComponent(session.projectId)}/robot-connection/host-key`,{},30000);
+      if (!robotConnectionIsCurrent(session)) return;
+      if (configSignature !== JSON.stringify(robotConnectionConfig(session.data.config)) || robotConnectionChanged(session)) throw new Error("접속 정보가 변경되었습니다. 호스트 키를 다시 확인해주세요.");
+      if (typeof result.verification_id !== "string" || !result.verification_id || !Array.isArray(result.keys) || !result.keys.length || !result.keys.every(key => typeof key.algorithm === "string" && key.algorithm && typeof key.fingerprint === "string" && key.fingerprint)) throw new Error("확인할 호스트 키 지문을 받지 못했습니다. 다시 확인해주세요.");
+      if (result.destination !== robotConnectionDestination(session.data.config)) throw new Error("저장한 접속 대상과 키 확인 응답이 다릅니다. 호스트 키를 다시 확인해주세요.");
+      state.robotHostKey = {projectId:session.projectId,routeToken:session.routeToken,verificationId:result.verification_id,configSignature,busy:false,invalid:false};
+      $("robot-host-key-content").innerHTML = `<p class="dialog-description"><strong>${esc(session.data.config.name)}</strong><br>${esc(result.destination || robotConnectionDestination(session.data.config))}</p>${result.changed ? '<p class="robot-host-key-warning" role="alert"><strong>호스트 키가 변경되었습니다.</strong> 대상 PC에서 확인한 지문과 일치하는 경우에만 등록하세요.</p>' : ""}<p class="field-note">대상 PC에서 확인한 지문 또는 관리자가 제공한 지문과 아래 값을 비교한 뒤 등록하세요.</p><ul class="robot-host-key-list">${result.keys.map(key => `<li><span>${esc(key.algorithm)}</span><code>${esc(key.fingerprint)}</code></li>`).join("")}</ul><p class="field-note">등록한 키는 RILO 전용 known_hosts에 저장합니다. 사용자 계정의 기존 known_hosts는 변경하지 않습니다.</p>`;
+      $("robot-host-key-error").hidden = true;$("robot-host-key-error").textContent = "";
+      $("robot-host-key-dialog").showModal();updateRobotHostKeyDialog();
+    } catch (error) {
+      if (robotConnectionIsCurrent(session)) {session.error = error.status === 404 && error.detail === "Not Found" ? "현재 서버에 호스트 키 확인 기능이 반영되지 않았습니다. RILO 서버를 재시작한 뒤 새로고침해주세요." : error.message;updateRemoteRobotConnection();}
+    } finally {
+      if (state.robotConnectionMutation === mutation) state.robotConnectionMutation = null;
+      if (robotConnectionIsCurrent(session)) {updateRemoteRobotConnection();scheduleRobotConnectionRefresh(session);}
+    }
+  }
+
+  async function trustRobotHostKey() {
+    const pending = state.robotHostKey, session = state.robotConnection;
+    const current = () => Boolean(pending && state.robotHostKey === pending && $("robot-host-key-dialog").open && robotConnectionIsCurrent(session) && pending.projectId === session.projectId && pending.routeToken === session.routeToken);
+    if (!current() || pending.busy || pending.invalid || state.robotConnectionMutation || state.remotePolicyMutation) return;
+    const reason = robotHostKeyBlockReason(session);
+    if (reason || pending.configSignature !== JSON.stringify(robotConnectionConfig(session.data.config))) {updateRobotHostKeyDialog();return;}
+    pending.busy = true;session.controller?.abort();session.controller = null;session.request += 1;session.busy = false;clearTimeout(session.timer);
+    const mutation = {projectId:session.projectId,action:"host-key-trust"};state.robotConnectionMutation = mutation;
+    $("robot-host-key-error").hidden = true;updateRemoteRobotConnection();
+    try {
+      const response = await api(`/api/projects/${encodeURIComponent(session.projectId)}/robot-connection/host-key/trust`,{verification_id:pending.verificationId},30000);
+      if (!current()) return;
+      installRobotConnectionResponse(session,response);
+      $("robot-host-key-dialog").close();toast("호스트 키를 등록했습니다. SSH 연결 버튼으로 연결하세요.");
+    } catch (error) {
+      if (current()) {
+        if (error.status === 409) pending.invalid = true;
+        $("robot-host-key-error").textContent = `${error.status === 409 ? "연결 상태를 확인한 뒤 창을 닫고 호스트 키를 다시 확인해주세요. " : ""}${error.message}`;
+        $("robot-host-key-error").hidden = false;
+      }
+    } finally {
+      pending.busy = false;if (state.robotConnectionMutation === mutation) state.robotConnectionMutation = null;
+      if (robotConnectionIsCurrent(session)) {updateRemoteRobotConnection();scheduleRobotConnectionRefresh(session);}
+    }
+  }
+
+  function remoteLaunchConfig(value = {}) {
+    return {client_directory:String(value.client_directory ?? "~/rilo_robot_client").trim(),conda_env:String(value.conda_env ?? "hilserl").trim(),python_executable:String(value.python_executable ?? "").trim() || null,env_config:String(value.env_config ?? "").trim() || null,adapter:String(value.adapter ?? "").trim() || null,mode:value.mode || "probe"};
+  }
+
+  function remoteLaunchChanged(session) {
+    return JSON.stringify(remoteLaunchConfig(session.launchDraft)) !== JSON.stringify(remoteLaunchConfig(session.data?.launch_config));
+  }
+
+  function remoteLauncherHeld(session) {
+    const phase = session?.data?.launcher?.phase;
+    return Boolean(session?.data?.active_launcher?.project_id === session?.projectId || phase && !["idle","disconnected","stopped","error"].includes(phase));
+  }
+
+  function remoteLaunchConfigError(config) {
+    if (!config.client_directory || config.client_directory.length>4096 || !config.client_directory.startsWith("/") && !config.client_directory.startsWith("~/")) return "로봇 PC의 client 디렉터리를 절대 경로 또는 ~/ 경로로 입력해주세요.";
+    if (!config.conda_env || config.conda_env.length>128 || !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(config.conda_env)) return "Conda 환경 이름은 영문·숫자·밑줄로 시작하며 점과 하이픈을 사용할 수 있습니다.";
+    if (config.python_executable && (config.python_executable.length>4096 || !config.python_executable.startsWith("/") && !config.python_executable.startsWith("~/"))) return "Python 실행 파일은 절대 경로 또는 ~/ 경로로 입력해주세요.";
+    if (config.adapter && (config.adapter.length>256 || !/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$/.test(config.adapter))) return "환경 Adapter를 package.module:factory 형식으로 입력해주세요.";
+    if (config.env_config && config.env_config.length>4096) return "로봇 환경 JSON 경로는 4096자 이하로 입력해주세요.";
+    if (!["probe","mock","robot"].includes(config.mode)) return "Client 실행 모드를 선택해주세요.";
+    if (config.mode === "robot" && (!config.adapter || !config.env_config)) return "실제 로봇 모드는 adapter(module:factory)와 환경 JSON 경로가 필요합니다.";
+    if (Object.values(config).some(value => typeof value === "string" && /[\x00-\x1f\x7f]/.test(value))) return "연결 설정에는 줄바꿈이나 제어 문자를 사용할 수 없습니다.";
+    return "";
+  }
+
+  function remoteEnvironmentBlockReason(action,session = state.remotePolicy) {
+    if (!remotePolicyIsCurrent(session) || !state.connected || !session.data || session.stale) return "Client 상태를 확인해주세요.";
+    if (state.remotePolicyMutation || state.robotConnectionMutation) return "이전 연결 요청을 처리하고 있습니다.";
+    const capability = {"launch-config":"configure_launch","environment/connect":"environment_connect","environment/disconnect":"environment_disconnect"}[action];
+    if (session.data.capabilities?.[capability] !== true) return session.data.reasons?.[capability] || "현재 연결 상태에서는 이 동작을 실행할 수 없습니다.";
+    if (remoteRunActive(session.data.run)) return "진행 중인 run을 먼저 중지해주세요.";
+    const held = remoteLauncherHeld(session), connected = session.data.client?.connected === true;
+    if (action === "launch-config") return held || connected ? "Client 환경 연결을 해제한 뒤 실행 설정을 저장하세요." : "";
+    if (action === "environment/disconnect") return "";
+    if (held || connected) return "이미 환경이 연결되어 있거나 연결 중입니다.";
+    if (remoteLaunchChanged(session)) return "변경한 client 실행 설정을 먼저 저장해주세요.";
+    const owner = state.robotConnection?.data?.active_connection;
+    if (owner?.project_id && owner.project_id !== session.projectId) return "다른 프로젝트의 SSH 연결을 먼저 해제해주세요.";
+    if (!state.robotConnection?.data?.config) return "위에서 로봇 PC의 SSH 접속 정보를 먼저 저장해주세요.";
+    return remoteLaunchConfigError(remoteLaunchConfig(session.launchDraft));
+  }
+
+  function renderRemoteLaunchSettings(session) {
+    const config = session.launchDraft;
+    return `<section class="remote-launch-section"><h3>Client 환경 연결</h3><p class="field-note">로봇 PC에 client 코드를 준비한 뒤 실행 경로를 저장하세요. 환경 연결은 SSH 접속·터널·client 실행을 차례로 요청합니다. 연결만으로 episode를 시작하지 않습니다.</p><form id="remote-launch-form"><fieldset id="remote-launch-fields" class="remote-launch-fields"><label class="field">Client 디렉터리<input name="client_directory" required maxlength="4096" value="${esc(config.client_directory)}" placeholder="~/rilo_robot_client"><small>로봇 PC에서 client 코드가 위치한 경로입니다.</small></label><label class="field">Conda 환경<input name="conda_env" required maxlength="128" value="${esc(config.conda_env)}" placeholder="hilserl"></label><label class="field">Python 실행 파일 <span class="optional">선택</span><input name="python_executable" maxlength="4096" value="${esc(config.python_executable || "")}" placeholder="/절대경로/bin/python"><small>입력하면 Conda 환경 대신 이 실행 파일을 사용합니다.</small></label><label class="field">실행 모드<select name="mode"><option value="probe">진단 · 통신 확인</option><option value="mock">Mock · 시뮬레이션</option><option value="robot">실제 로봇</option></select></label><label class="field">로봇 환경 JSON 경로<input name="env_config" maxlength="4096" value="${esc(config.env_config || "")}" placeholder="/로봇PC/경로/environment.json"></label><label class="field">환경 Adapter<input name="adapter" maxlength="256" value="${esc(config.adapter || "")}" placeholder="package.module:factory"><small>실제 로봇 모드에는 해당 로봇에 맞는 adapter와 환경 JSON이 필요합니다.</small></label></fieldset><div class="robot-config-actions"><p id="remote-launch-config-note" class="field-note"></p><button id="remote-launch-save" class="button secondary" type="submit" disabled>${icon("check")}실행 설정 저장</button></div></form><div class="remote-environment-actions"><button id="remote-environment-connect" class="button primary" type="button" data-action="remote-environment-connect" disabled>${icon("robot")}환경 연결</button><button id="remote-environment-disconnect" class="button danger" type="button" data-action="remote-environment-disconnect" disabled>${icon("close")}환경 연결 해제</button><span id="remote-launch-state" class="tag neutral">대기 중</span></div><p id="remote-environment-note" class="field-note" role="status"></p><details class="remote-contract"><summary>Client 실행 로그</summary><pre id="remote-launch-log">아직 실행 기록이 없습니다.</pre></details></section>`;
+  }
+
+  function editRemoteLaunchField(input) {
+    const session = state.remotePolicy;if (!remotePolicyIsCurrent(session) || !input.name || !Object.hasOwn(session.launchDraft,input.name)) return;
+    session.launchDraft[input.name] = input.value;session.launchDirty = true;session.error = null;updateRemotePolicyPanel();
+  }
+
+  function updateRemoteLaunchSettings(session) {
+    const launcher = session.data?.launcher || {}, config = session.launchDraft;
+    const locked = !state.connected || !session.data || session.stale || session.data.capabilities?.configure_launch !== true || remoteLauncherHeld(session) || session.data?.client?.connected === true || Boolean(state.remotePolicyMutation || state.robotConnectionMutation);
+    $("remote-launch-fields").disabled = locked;
+    for (const key of Object.keys(config)) {const input = $("remote-launch-form").elements.namedItem(key);if (input) {input.disabled = locked;if (!session.launchDirty) input.value = config[key] ?? "";}}
+    const changed = remoteLaunchChanged(session), pending = state.remotePolicyMutation?.projectId === session.projectId ? state.remotePolicyMutation.action : null;
+    $("remote-launch-save").disabled = Boolean(remoteEnvironmentBlockReason("launch-config",session) || !changed);
+    $("remote-launch-save").textContent = pending === "launch-config" ? "저장 중…" : "실행 설정 저장";
+    $("remote-launch-config-note").textContent = changed ? "변경한 실행 설정을 저장한 뒤 환경을 연결하세요." : "저장한 실행 설정입니다. 저장만으로 SSH나 client를 시작하지 않습니다.";
+    const connectReason = remoteEnvironmentBlockReason("environment/connect",session), disconnectReason = remoteEnvironmentBlockReason("environment/disconnect",session);
+    $("remote-environment-connect").disabled = Boolean(connectReason);$("remote-environment-connect").title = connectReason;
+    $("remote-environment-disconnect").disabled = Boolean(disconnectReason);$("remote-environment-disconnect").title = disconnectReason;
+    const phaseLabels = {idle:"대기 중",disconnected:"연결 안 됨",connecting:"환경 연결 중",preparing:"실행 준비 중",starting:"Client 시작 중",running:"Client 실행 중",connected:"환경 연결됨",stopping:"연결 해제 중",disconnecting:"연결 해제 중",stopped:"연결 해제됨",error:"확인 필요"};
+    $("remote-launch-state").textContent = phaseLabels[launcher.phase] || launcher.phase || "대기 중";
+    $("remote-launch-state").className = `tag ${launcher.phase === "error" ? "warning" : session.data?.client?.connected ? "success" : "neutral"}`;
+    $("remote-environment-note").textContent = launcher.error || connectReason || (config.mode === "probe" ? "진단 모드는 통신만 확인합니다. 관측·로봇 동작을 제공하지 않습니다." : config.mode === "mock" ? "Mock 환경에서 연결과 정책 실행 흐름을 확인합니다." : "Client와 로봇 adapter를 연결합니다. Episode는 수집 시작 버튼으로 별도 요청합니다.");
+    $("remote-launch-log").textContent = Array.isArray(launcher.logs) ? launcher.logs.map(item => typeof item === "string" ? item : item.message || JSON.stringify(item)).join("\n") || "아직 실행 기록이 없습니다." : typeof launcher.logs === "string" ? launcher.logs : "아직 실행 기록이 없습니다.";
+  }
+
+  async function remoteEnvironmentCommand(action,event) {
+    event?.preventDefault();
+    const session = state.remotePolicy;
+    if (!["launch-config","environment/connect","environment/disconnect"].includes(action) || remoteEnvironmentBlockReason(action,session)) return;
+    if (action === "launch-config" && !remoteLaunchChanged(session)) return;
+    const payload = action === "launch-config" ? remoteLaunchConfig(session.launchDraft) : {};
+    if (action === "launch-config") {const error = remoteLaunchConfigError(payload);if (error) {session.error = error;updateRemotePolicyPanel();return;}}
+    if (action === "environment/connect") session.issuedConfig = null;
+    const mutation = {projectId:session.projectId,action};state.remotePolicyMutation = mutation;session.error = null;
+    clearTimeout(session.timer);session.controller?.abort();session.request += 1;session.busy = false;session.controller = null;updateRemotePolicyPanel();updateRemoteRobotConnection();
+    try {
+      const response = await api(remotePolicyPath(session)+"/"+action,payload,30000);
+      if (!remotePolicyIsCurrent(session)) return;
+      if (action === "launch-config") session.launchDirty = false;
+      installRemotePolicyResponse(session,response);
+      toast({"launch-config":"Client 실행 설정을 저장했습니다.","environment/connect":"환경 연결을 요청했습니다. SSH와 client 상태를 확인합니다.","environment/disconnect":"Client 환경과 SSH 연결 해제를 요청했습니다."}[action]);
+    } catch (error) {if (remotePolicyIsCurrent(session)) {session.error = error.message;session.stale = true;}}
+    finally {if (state.remotePolicyMutation === mutation) state.remotePolicyMutation = null;if (remotePolicyIsCurrent(session)) {updateRemotePolicyPanel();updateRemoteRobotConnection();scheduleRemotePolicyRefresh(session);refreshRobotConnection();}else if (remotePolicyIsCurrent()) updateRemotePolicyPanel();}
+  }
+
+  function remotePolicyIsCurrent(session = state.remotePolicy) {
+    return Boolean(session && state.remotePolicy === session && session.projectId === state.route.id && session.routeToken === state.routeToken && state.route.tab === "collection" && remoteRobotProject());
+  }
+
+  function remotePolicyPath(session = state.remotePolicy) {
+    return `/api/projects/${encodeURIComponent(session.projectId)}/remote`;
+  }
+
+  function remoteRunActive(run) {
+    return Boolean(run && ["preparing","running","pausing","paused","stopping"].includes(run.status));
+  }
+
+  function stopRemotePolicyPolling() {
+    const session = state.remotePolicy;
+    if (session) {clearTimeout(session.timer);session.controller?.abort();session.frameToken += 1;session.issuedConfig = null;}
+    state.remotePolicy = null;
+    if ($("remote-token-dialog")?.open) $("remote-token-dialog").close();
+  }
+
+  function remoteRunConfig(value = {}) {
+    return {policy:value.policy || "gpt",model_id:value.model_id || null,residual_model_id:value.residual_model_id || null,episodes:Number(value.episodes ?? 1),device:String(value.device || "cuda:0"),max_episode_steps:Number(value.max_episode_steps ?? 300),max_reset_steps:Number(value.max_reset_steps ?? 300),max_task_calls:Number(value.max_task_calls ?? 50),max_reset_calls:Number(value.max_reset_calls ?? 40),budget_usd:Number(value.budget_usd ?? 15),training:value.training === true};
+  }
+
+  function remoteResidualTrainingAvailable(session = state.remotePolicy) {
+    return session?.data?.client?.capabilities?.residual_training === true && session.data.capabilities?.residual_training !== false;
+  }
+
+  function remoteRunConfigError(config, session = state.remotePolicy) {
+    if (!["gpt","dp","residual","dummy"].includes(config.policy)) return "실행할 정책을 선택해주세요.";
+    if (config.policy === "dummy" && session?.data?.client?.capabilities?.simulation !== true) return "Mock 정책은 시뮬레이션 client에서만 사용할 수 있습니다.";
+    const models = session?.data?.models || [];
+    if (config.policy === "residual" && session?.data?.client?.capabilities?.residual_step !== true) return "이 client는 control tick마다 Residual 보정을 적용하는 기능을 지원하지 않습니다.";
+    if (["dp","residual"].includes(config.policy) && !models.some(model => model.id === config.model_id && model.kind === "bc")) return "이 프로젝트의 DP 모델을 선택해주세요.";
+    if (config.policy === "residual" && !models.some(model => model.id === config.residual_model_id && model.kind === "residual")) return "이 프로젝트의 Residual TD3 모델을 선택해주세요.";
+    for (const [key,label,max] of [["episodes","Run 당 episode 수",100],["max_episode_steps","최대 episode 길이",10000],["max_reset_steps","최대 reset step",10000],["max_task_calls","Task GPT 호출 한도",10000],["max_reset_calls","Reset GPT 호출 한도",1000]]) {
+      if (!Number.isInteger(config[key]) || config[key]<1 || config[key]>max) return `${label}는 1~${max} 사이의 정수로 입력해주세요.`;
+    }
+    if (!Number.isFinite(config.budget_usd) || config.budget_usd<=0 || config.budget_usd>1000) return "API 비용 한도는 $0 초과, $1,000 이하로 입력해주세요.";
+    if (!config.device.trim()) return "정책 실행 장치를 선택해주세요.";
+    if (config.training && (config.policy !== "residual" || !remoteResidualTrainingAvailable(session))) return "현재 연결에서는 Residual 학습을 지원하지 않습니다.";
+    return "";
+  }
+
+  function remotePolicyBlockReason(action, session = state.remotePolicy) {
+    if (!remotePolicyIsCurrent(session) || !state.connected || !session.data || session.stale) return "로봇 client 상태를 먼저 확인해주세요.";
+    if (state.remotePolicyMutation) return "이전 요청을 처리하고 있습니다.";
+    if (action === "token") return remoteRunActive(session.data.run) ? "진행 중인 run을 중지한 뒤 토큰을 재발급할 수 있습니다." : session.data.active_launcher || remoteLauncherHeld(session) ? "Client 환경 연결을 해제한 뒤 토큰을 발급하거나 재발급하세요." : "";
+    if (action === "start" && session.data.client?.connected !== true) return "로봇 PC의 client를 연결해주세요. SSH 연결 상태와 별도로 확인합니다.";
+    if (session.data.capabilities?.[action] !== true) return session.data.reasons?.[action] || "현재 client 상태에서는 이 동작을 실행할 수 없습니다.";
+    return "";
+  }
+
+  function remoteServerUrl(value) {
+    try {const parsed = new URL(String(value).trim());if (!["http:","https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname.replace(/\/$/,"") !== "/robot/v1") return null;return parsed.href.replace(/\/$/,"");} catch {return null;}
+  }
+
+  function renderRemotePolicyPanel(project) {
+    if (!remotePolicyIsCurrent()) {
+      stopRemotePolicyPolling();
+      state.remotePolicy = {projectId:project.id,routeToken:state.routeToken,data:null,draft:remoteRunConfig(),dirty:false,launchDraft:remoteLaunchConfig(),launchDirty:false,baseUrl:"",baseUrlDirty:false,issuedConfig:null,error:null,readError:null,stale:false,busy:false,request:0,timer:null,controller:null,frameToken:0,frameSignature:"",modelSignature:""};
+    }
+    const draft = state.remotePolicy.draft;
+    state.remotePolicy.modelSignature = "";state.remotePolicy.frameSignature = "";state.remotePolicy.cameraSignature = "";state.remotePolicy.frameToken += 1;
+    return `<section id="remote-policy-panel" class="panel remote-policy-panel"><div class="panel-header"><div><h2>로봇 client / 정책 서버</h2><p>로봇 PC의 client가 환경 계약과 실행 상태를 전달합니다.</p></div><span id="remote-client-state" class="tag neutral">상태 확인 중</span></div><div class="panel-body">${renderRemoteLaunchSettings(state.remotePolicy)}<section class="remote-client-setup"><p class="field-note">위쪽 SSH 연결은 PC 접속 진단입니다. 환경 연결 버튼은 SSH·터널·로봇 PC의 client를 함께 준비합니다. Client의 실행 준비가 확인된 뒤에만 아래 제어를 사용할 수 있습니다.</p><details class="remote-contract remote-manual-config"><summary>수동 client 연결 설정과 토큰</summary><label class="field">로봇 PC에서 접속할 정책 서버 URL<input id="remote-server-url" type="url" autocomplete="off" spellcheck="false" placeholder="http://RILO서버IP:8000/robot/v1"><small>SSH 터널을 사용하면 http://127.0.0.1:45587/robot/v1을 사용합니다. 직접 연결할 때는 로봇 PC에서 접근 가능한 RILO 서버 주소를 입력하세요.</small></label><div class="remote-client-actions"><button id="remote-token-issue" type="button" class="button secondary" data-action="remote-token-issue" disabled>${icon("check")}연결 토큰 발급</button><button id="remote-config-download" type="button" class="button secondary" data-action="remote-config-download" disabled>${icon("download")}연결 설정 다운로드 (.json)</button><button id="remote-status-refresh" type="button" class="button secondary" data-action="remote-status-refresh" disabled>${icon("reset")}상태 확인</button></div><p id="remote-token-note" class="remote-token-note">발급한 토큰은 이 화면에서만 다운로드할 수 있습니다. 설정 파일에는 인증 토큰이 포함되므로 로봇 PC에서 chmod 600으로 권한을 설정하세요.</p></details><dl class="remote-client-details"><div><dt>Client</dt><dd id="remote-client-id">—</dd></div><div><dt>실행 준비</dt><dd id="remote-client-phase">—</dd></div><div><dt>최근 heartbeat</dt><dd id="remote-client-heartbeat">—</dd></div><div><dt>환경</dt><dd id="remote-client-environment">—</dd></div><div><dt>세션</dt><dd id="remote-client-session">—</dd></div><div><dt>프로토콜</dt><dd id="remote-client-protocol">—</dd></div></dl><details class="remote-contract"><summary>환경 계약과 client 지원 기능</summary><pre id="remote-contract">client가 연결되면 확인할 수 있습니다.</pre></details></section><div class="remote-run-layout"><form id="remote-run-form"><fieldset id="remote-run-fields" class="remote-run-fields"><label class="field full">Run 정책<select id="remote-policy-kind" name="policy" data-remote-run="policy"><option value="gpt">GPT</option><option value="dp">Diffusion Policy</option><option value="residual">Residual TD3</option><option value="dummy" disabled>Mock · 시뮬레이션 전용</option></select></label><label id="remote-model-field" class="field full">DP 모델<select id="remote-model-id" name="model_id" data-remote-run="model_id"><option value="">모델을 선택하세요</option></select></label><label id="remote-residual-field" class="field full">Residual TD3 모델<select id="remote-residual-model-id" name="residual_model_id" data-remote-run="residual_model_id"><option value="">모델을 선택하세요</option></select></label><p id="remote-policy-note" class="field-note full"></p>${numericField("episodes","Run 당 episode 수",draft.episodes,1,100,"개")}${numericField("budget_usd","API 비용 한도",draft.budget_usd,.01,1000,"$",.01)}${numericField("max_episode_steps","최대 episode 길이",draft.max_episode_steps,1,10000,"steps")}${numericField("max_reset_steps","최대 reset step",draft.max_reset_steps,1,10000,"steps")}${numericField("max_task_calls","Task GPT 호출 한도",draft.max_task_calls,1,10000,"회")}${numericField("max_reset_calls","Reset GPT 호출 한도",draft.max_reset_calls,1,1000,"회")}<label class="field full">정책 실행 장치<select id="remote-device" name="device" data-remote-run="device"><option value="cuda:0">CUDA:0</option><option value="cuda">CUDA</option><option value="auto">자동</option><option value="cpu">CPU</option></select></label><label id="remote-training-field" class="robot-remember-option full" hidden><input id="remote-training" name="training" data-remote-run="training" type="checkbox"><span>Residual 온라인 학습</span></label></fieldset><p class="field-note">입력값은 새 run 시작 시 확정됩니다. Pause·재개는 기존 run 설정을 유지합니다. 한 번만 실행은 1 episode와 reset을 수행합니다.</p><div class="remote-run-actions"><button id="remote-run-start" class="button primary" type="submit" disabled>${icon("play")}수집 시작</button><button id="remote-run-once" class="button secondary" type="button" data-action="remote-run-once" disabled>${icon("step")}한 번만 실행</button><button id="remote-run-pause" class="button pause" type="button" data-action="remote-run-pause" disabled>${icon("pause")}Pause</button><button id="remote-run-resume" class="button secondary" type="button" data-action="remote-run-resume" disabled>${icon("play")}재개</button><button id="remote-run-stop" class="button danger" type="button" data-action="remote-run-stop" disabled>${icon("stop")}중지</button></div><p id="remote-run-note" class="field-note" role="status"></p></form><section class="remote-run-live"><h3>최근 관측과 실행 상태</h3><div id="remote-live-images" class="remote-live-images"><div class="remote-live-empty">client가 전달한 현재 프로젝트의 관측만 표시합니다.</div></div><p id="remote-run-status" class="remote-run-status" role="status">Run 대기 중</p><dl class="remote-run-progress"><div><dt>완료 / 목표 episode</dt><dd id="remote-run-episodes">—</dd></div><div><dt>Task / Reset steps</dt><dd id="remote-run-steps">—</dd></div><div><dt>Task / Reset GPT 호출</dt><dd id="remote-run-calls">—</dd></div><div><dt>추정 API 비용</dt><dd id="remote-run-cost">—</dd></div><div><dt>Run</dt><dd id="remote-run-id">—</dd></div><div><dt>Episode</dt><dd id="remote-run-episode">—</dd></div><div><dt>현재 run 정책</dt><dd id="remote-run-policy">—</dd></div><div><dt>현재 run 한도</dt><dd id="remote-run-limits">—</dd></div></dl><p class="field-note">Pause·중지는 client의 로컬 정지 처리를 요청합니다. 물리 비상정지와 controller watchdog은 로봇 PC에서 유지해야 합니다.</p></section></div><p id="remote-policy-error" class="form-error" role="alert" hidden></p></div></section>`;
+  }
+
+  function editRemoteRunField(input) {
+    const session = state.remotePolicy;
+    if (!remotePolicyIsCurrent(session) || !input.name || !Object.hasOwn(session.draft,input.name)) return;
+    session.draft[input.name] = input.name === "training" ? input.checked : input.value;
+    if (input.name === "policy" && input.value !== "residual") session.draft.training = false;
+    if (input.name === "residual_model_id") {const model = session.data?.models?.find(item => item.id === input.value);if (model?.base_model_id && session.data.models.some(item => item.id === model.base_model_id && item.kind === "bc")) session.draft.model_id = model.base_model_id;}
+    session.dirty = true;session.error = null;updateRemotePolicyPanel();
+  }
+
+  function updateRemotePolicyPanel() {
+    const session = state.remotePolicy;
+    if (!remotePolicyIsCurrent(session) || !$("remote-policy-panel")) return;
+    const data = session.data, client = data?.client, run = data?.run, draft = session.draft, active = remoteRunActive(run), pending = state.remotePolicyMutation?.projectId === session.projectId ? state.remotePolicyMutation.action : null;
+    const unavailable = !state.connected || !data || session.stale;
+    $("remote-client-state").textContent = unavailable ? data ? "상태 확인 필요" : "상태 확인 중" : client?.connected ? "Client 연결됨" : "Client 연결 안 됨";
+    $("remote-client-state").className = `tag ${unavailable ? "neutral" : client?.connected ? "success" : "neutral"}`;
+    $("remote-client-id").textContent = client?.client_id || "—";
+    $("remote-client-phase").textContent = client?.phase || "—";
+    $("remote-client-heartbeat").textContent = client?.last_seen ? date(client.last_seen,{second:"2-digit"}) : "—";
+    $("remote-client-session").textContent = client?.session_id || "—";
+    $("remote-client-protocol").textContent = data?.protocol || "—";
+    $("remote-client-environment").textContent = client?.environment?.name || client?.environment?.backend || "—";
+    $("remote-contract").textContent = client ? JSON.stringify({environment:client.environment,capabilities:client.capabilities},null,2) : "client가 연결되면 확인할 수 있습니다.";
+    if (!session.baseUrlDirty) $("remote-server-url").value = session.baseUrl;
+    $("remote-token-issue").disabled = Boolean(remotePolicyBlockReason("token",session));
+    $("remote-token-issue").textContent = pending === "token" ? "토큰 발급 중…" : data?.token_configured ? "연결 토큰 재발급" : "연결 토큰 발급";
+    $("remote-config-download").disabled = !session.issuedConfig || !remoteServerUrl(session.baseUrl);
+    $("remote-status-refresh").disabled = Boolean(session.busy || pending);
+    $("remote-token-note").textContent = session.issuedConfig ? "토큰을 발급했습니다. 화면을 떠나기 전에 연결 설정을 다운로드하세요. 파일에는 토큰이 포함되며 로봇 PC에서 chmod 600으로 권한을 설정해야 합니다." : data?.token_configured ? "이미 토큰이 발급되어 있습니다. 기존 토큰은 다시 조회하지 않습니다. 재발급하면 기존 client 세션과 연결 설정을 사용할 수 없습니다." : "발급한 토큰은 이 화면에서만 다운로드할 수 있습니다. 설정 파일에는 인증 토큰이 포함되므로 로봇 PC에서 chmod 600으로 권한을 설정하세요.";
+    const locked = unavailable || active || Boolean(pending);
+    $("remote-run-fields").disabled = locked;
+    if (![...$("remote-device").options].some(option => option.value === draft.device)) $("remote-device").add(new Option(draft.device,draft.device));
+    for (const key of Object.keys(draft)) {const input = $("remote-run-form").elements.namedItem(key);if (input) {input.disabled = locked;if (key === "training") input.checked = draft.training === true;else if (!["model_id","residual_model_id"].includes(key)) input.value = draft[key] ?? "";}}
+    const models = data?.models || [], signature = JSON.stringify(models.map(model => [model.id,model.name,model.kind,model.base_model_id]));
+    if (signature !== session.modelSignature) {session.modelSignature = signature;for (const [id,kind] of [["remote-model-id","bc"],["remote-residual-model-id","residual"]]) $(id).innerHTML = `<option value="">${models.some(model => model.kind === kind) ? "모델을 선택하세요" : "등록된 모델이 없습니다"}</option>`+models.filter(model => model.kind === kind).map(model => `<option value="${esc(model.id)}">${esc(model.name || model.id)}</option>`).join("");}
+    $("remote-model-id").value = draft.model_id || "";$("remote-residual-model-id").value = draft.residual_model_id || "";
+    const policyChoices = [...$("remote-policy-kind").options];
+    const dummyOption = policyChoices.find(option => option.value === "dummy");if (dummyOption) dummyOption.disabled = client?.capabilities?.simulation !== true;
+    const residualOption = policyChoices.find(option => option.value === "residual");if (residualOption) residualOption.disabled = client?.capabilities?.residual_step !== true;
+    $("remote-model-field").hidden = !["dp","residual"].includes(draft.policy);$("remote-residual-field").hidden = draft.policy !== "residual";
+    $("remote-training-field").hidden = draft.policy !== "residual" || !remoteResidualTrainingAvailable(session);
+    $("remote-training").disabled = locked || $("remote-training-field").hidden;
+    $("remote-policy-note").textContent = draft.policy === "gpt" ? `GPT 설정: ${policyLabel(nextPolicy(currentProject()))}. 프로젝트 설정에서 변경할 수 있습니다.` : draft.policy === "dummy" ? "Mock는 시뮬레이션 연결과 메시지 흐름을 확인하는 테스트 정책입니다." : "선택한 checkpoint와 client의 카메라·상태·action 계약을 서버가 검증합니다. action 차원이 같다는 이유만으로 호환되는 것은 아닙니다.";
+    const startReason = remotePolicyBlockReason("start",session);
+    $("remote-run-start").disabled = Boolean(startReason);$("remote-run-once").disabled = Boolean(startReason);
+    for (const action of ["pause","resume","stop"]) {const reason = remotePolicyBlockReason(action,session);$("remote-run-"+action).disabled = Boolean(reason);$("remote-run-"+action).title = reason;}
+    $("remote-run-start").innerHTML = icon("play")+(pending === "start" ? "시작 요청 중…" : "수집 시작");
+    $("remote-run-note").textContent = active ? "현재 run의 설정은 고정됩니다. Pause 후 재개해도 기존 목표와 정책을 유지합니다." : startReason || "새 run을 시작할 준비가 되었습니다. 버튼을 누르기 전까지 정책 실행을 요청하지 않습니다.";
+    const statusLabels = {preparing:"정책 준비 중",running:"실행 중",pausing:"일시정지 중",paused:"일시정지",stopping:"중지 중",stopped:"중지됨",completed:"완료",error:"확인 필요"};
+    const phaseLabels = {task:"Task",reset:"Reset",arm_reset:"팔 복구",awaiting_episode:"다음 episode 대기"};
+    $("remote-run-status").textContent = run ? `${statusLabels[run.status] || run.status} · ${phaseLabels[run.phase] || run.phase || "—"}${client?.connected ? "" : " · client 연결 확인 필요"}` : "Run 대기 중";
+    $("remote-run-episodes").textContent = run ? `${count(run.completed_episodes)} / ${count(run.target_episodes)}` : "—";
+    $("remote-run-steps").textContent = run ? `${count(run.task_steps)} / ${count(run.reset_steps)}` : "—";
+    $("remote-run-calls").textContent = run ? `${count(run.task_calls)} / ${count(run.reset_calls)}` : "—";
+    $("remote-run-cost").textContent = run ? money(run.estimated_cost_usd,4) : "—";
+    $("remote-run-id").textContent = run?.id || "—";$("remote-run-episode").textContent = run?.episode_id || "—";
+    const runConfig = run?.config || {}, policyName = {gpt:"GPT",dp:"Diffusion Policy",residual:"Residual TD3",dummy:"Mock"}[run?.policy || runConfig.policy];
+    $("remote-run-policy").textContent = run ? [policyName || "—",runConfig.residual_model_id || runConfig.model_id,runConfig.device].filter(Boolean).join(" · ") : "—";
+    $("remote-run-limits").textContent = run?.config ? `Task ${count(runConfig.max_episode_steps)} / Reset ${count(runConfig.max_reset_steps)} steps · ${money(runConfig.budget_usd)}` : "—";
+    const error = session.error || session.readError || run?.error;
+    $("remote-policy-error").textContent = typeof error === "string" ? error : error ? JSON.stringify(error) : "";$("remote-policy-error").hidden = !error;
+    updateRemoteLaunchSettings(session);updateRemotePolicyFrames(session);
+    if ($("remote-token-dialog")?.open) $("remote-token-confirm").disabled = Boolean(remotePolicyBlockReason("token",session));
+  }
+
+  function updateRemotePolicyFrames(session) {
+    const prefix = remotePolicyPath(session)+"/frame/";
+    const frames = (session.data?.frames || []).filter(frame => typeof frame.camera === "string" && !frame.camera.startsWith("reset_reference") && typeof frame.url === "string" && frame.url.startsWith(prefix) && !frame.url.includes(".."));
+    const context = `${session.data?.client?.session_id || ""}:${session.data?.run?.id || ""}`;
+    const signature = JSON.stringify([context,frames]);
+    if (signature === session.frameSignature) return;
+    session.frameSignature = signature;const token = ++session.frameToken;
+    const cameras = JSON.stringify([context,frames.map(frame => frame.camera)]);
+    if (cameras !== session.cameraSignature) {session.cameraSignature = cameras;$("remote-live-images").innerHTML = frames.length ? frames.map((frame,index) => `<figure><img id="remote-frame-${index}" alt="${esc(frame.camera)} 최근 관측"><figcaption>${esc(frame.camera)}</figcaption></figure>`).join("") : '<div class="remote-live-empty">아직 client가 전달한 관측이 없습니다.</div>';}
+    frames.forEach((frame,index) => {const img = new Image();img.onload = () => {if (!remotePolicyIsCurrent(session) || token !== session.frameToken) return;const target = $("remote-frame-"+index);if (target) target.src = frame.url;};img.onerror = () => {if (remotePolicyIsCurrent(session) && token === session.frameToken) session.frameSignature = "";};img.src = frame.url;});
+  }
+
+  function installRemotePolicyResponse(session,response) {
+    if (!response || typeof response !== "object" || response.project_id && response.project_id !== session.projectId || !response.capabilities || !Array.isArray(response.models)) throw new Error("로봇 client 상태 응답을 확인할 수 없습니다.");
+    session.data = response;session.stale = false;
+    if (!session.dirty) session.draft = remoteRunConfig(response.defaults);
+    if (!session.launchDirty && response.launch_config) session.launchDraft = remoteLaunchConfig(response.launch_config);
+    if (!session.baseUrlDirty) session.baseUrl = response.client_url || "";
+  }
+
+  function scheduleRemotePolicyRefresh(session) {
+    clearTimeout(session.timer);
+    if (remotePolicyIsCurrent(session)) session.timer = setTimeout(refreshRemotePolicy,1500);
+  }
+
+  async function refreshRemotePolicy() {
+    const session = state.remotePolicy;if (!remotePolicyIsCurrent(session) || session.busy) return;
+    clearTimeout(session.timer);
+    if (state.remotePolicyMutation?.projectId === session.projectId) {scheduleRemotePolicyRefresh(session);return;}
+    const request = ++session.request;session.busy = true;session.controller = new AbortController();updateRemotePolicyPanel();
+    try {const response = await api(remotePolicyPath(session),undefined,8000,session.controller.signal);if (!remotePolicyIsCurrent(session) || request !== session.request) return;installRemotePolicyResponse(session,response);session.readError = null;}
+    catch (error) {if (remotePolicyIsCurrent(session) && request === session.request) {session.stale = true;session.readError = error.status === 404 && error.detail === "Not Found" ? "현재 서버에 로봇 client 기능이 반영되지 않았습니다. RILO 서버를 재시작한 뒤 새로고침해주세요." : error.message;}}
+    finally {if (request === session.request) {session.busy = false;session.controller = null;if (remotePolicyIsCurrent(session)) {updateRemotePolicyPanel();scheduleRemotePolicyRefresh(session);}}}
+  }
+
+  function requestRemoteToken() {
+    const session = state.remotePolicy;if (remotePolicyBlockReason("token",session)) return;
+    if (!remoteServerUrl(session.baseUrl)) {session.error = "로봇 PC에서 접근 가능한 http(s)://서버주소:포트/robot/v1 URL을 입력해주세요.";updateRemotePolicyPanel();return;}
+    if (session.data.token_configured) {$("remote-token-dialog").showModal();updateRemotePolicyPanel();}
+    else remotePolicyCommand("token");
+  }
+
+  async function remotePolicyCommand(action,event,once = false) {
+    event?.preventDefault();
+    const session = state.remotePolicy;
+    if (!["token","start","pause","resume","stop"].includes(action) || remotePolicyBlockReason(action,session)) return;
+    let payload = {};
+    if (action === "start") {
+      payload = remoteRunConfig(session.draft);if (once) payload.episodes = 1;
+      if (!["dp","residual"].includes(payload.policy)) payload.model_id = null;
+      if (payload.policy !== "residual") {payload.residual_model_id = null;payload.training = false;}
+      const error = remoteRunConfigError(payload,session);if (error) {session.error = error;updateRemotePolicyPanel();return;}
+    }
+    if (action === "token" && !remoteServerUrl(session.baseUrl)) {session.error = "정책 서버 URL을 확인해주세요.";updateRemotePolicyPanel();return;}
+    const mutation = {projectId:session.projectId,action};state.remotePolicyMutation = mutation;session.error = null;
+    clearTimeout(session.timer);session.controller?.abort();session.request += 1;session.busy = false;session.controller = null;updateRemotePolicyPanel();
+    try {
+      const response = await api(remotePolicyPath(session)+"/"+action,payload,30000);
+      if (!remotePolicyIsCurrent(session)) return;
+      if (action === "token") {
+        if (typeof response.token !== "string" || !response.token || response.client_config?.project_id && response.client_config.project_id !== session.projectId) throw new Error("발급 응답의 연결 토큰과 프로젝트를 확인할 수 없습니다. 상태를 확인하고 다시 발급해주세요.");
+        const config = response.client_config || {};
+        session.issuedConfig = {base_url:remoteServerUrl(session.baseUrl),project_token:response.token,client_id:config.client_id || "robot-pc-1",journal_path:config.journal_path || "./state/journal.sqlite3",control_hz:config.control_hz ?? 20,history_capacity:config.history_capacity ?? 64,request_timeout_seconds:config.request_timeout_seconds ?? 30,adapter_options:config.adapter_options || {}};
+        session.data.token_configured = true;if ($("remote-token-dialog").open) $("remote-token-dialog").close();
+        toast("연결 토큰을 발급했습니다. 연결 설정을 다운로드하세요.");
+      } else {installRemotePolicyResponse(session,response);toast({start:"원격 run 시작을 요청했습니다.",pause:"Client에 일시정지를 요청했습니다.",resume:"기존 run의 재개를 요청했습니다.",stop:"Client에 중지를 요청했습니다."}[action]);}
+    } catch (error) {if (remotePolicyIsCurrent(session)) {session.error = error.status === 404 && error.detail === "Not Found" ? "현재 서버에 로봇 client 기능이 반영되지 않았습니다. RILO 서버를 재시작한 뒤 새로고침해주세요." : error.message;session.stale = true;}}
+    finally {if (state.remotePolicyMutation === mutation) state.remotePolicyMutation = null;if (remotePolicyIsCurrent(session)) {updateRemotePolicyPanel();scheduleRemotePolicyRefresh(session);}else if (remotePolicyIsCurrent()) updateRemotePolicyPanel();}
+  }
+
+  function downloadRemoteConfig() {
+    const session = state.remotePolicy;if (!remotePolicyIsCurrent(session) || !session.issuedConfig) return;
+    const baseUrl = remoteServerUrl(session.baseUrl);if (!baseUrl) {session.error = "정책 서버 URL을 확인해주세요.";updateRemotePolicyPanel();return;}
+    const data = {...session.issuedConfig,base_url:baseUrl};
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data,null,2)+"\n"],{type:"application/json"}));
+    const link = document.createElement("a");link.href = url;link.download = `rilo-client-${session.projectId}.json`;link.click();setTimeout(() => URL.revokeObjectURL(url),1000);
+  }
+
+  function updateCollectionFrames() {
+    const holder = $("live-images"), project = currentProject(), status = state.status || {};
+    if (state.route.tab !== "collection" || !holder || !project) return;
+    const own = status.active_project_id === project.id, runId = status.run_id || null;
+    let view = state.collectionFrames;
+    const sameSource = view && view.holder === holder && view.routeToken === state.routeToken
+      && own && view.projectId === project.id && view.runId === runId;
+    if (!sameSource) {state.collectionFrames = null;view = null;}
+    const footer = $("observation-footer"), observation = own ? status.observation : null;
+    const waiting = !state.connected || status.phase === "initializing" || !observation?.id;
+    if (!own || waiting) {
+      if (view) {
+        // A reset/offline transition invalidates pending callbacks, but keeps decoded pixels.
+        view.slots.forEach(slot => {slot.pending = null;});
+        footer.textContent = !state.connected ? "서버 연결 확인 중 · 마지막 수집 화면을 유지합니다."
+          : view.slots.some(slot => slot.displayed) ? "새 관측 준비 중 · 같은 run 또는 환경의 마지막 화면을 유지합니다."
+          : "카메라 관측 수신 대기 중입니다.";
+        return;
+      }
+      if (!view || holder.dataset.framePlaceholder !== "true") {
+        holder.innerHTML = `<div class="live-placeholder">${icon("camera")}<h3>${own ? "카메라 관측을 기다리고 있습니다" : "수집 환경을 연결하세요"}</h3><p>${own ? "관측 이미지가 준비되면 화면을 표시합니다." : "현재 프로젝트에 연결된 실시간 관측이 없습니다.<br>환경 연결 후 카메라를 확인할 수 있습니다."}</p></div>`;
+        holder.dataset.framePlaceholder = "true";
+      }
+      footer.textContent = "카메라 대기 중 · 현재 프로젝트의 관측만 표시합니다.";
+      return;
+    }
+    const cameras = (Array.isArray(observation.cameras) ? observation.cameras.map(item => typeof item === "string" ? item : item.name) : Object.keys(observation.cameras || {})).filter(name => typeof name === "string" && name && !/^reset_reference(?:_|$)/.test(name));
+    const signature = JSON.stringify(cameras), observationId = observation.id;
+    if (!view || signature !== view.cameraSignature || holder.dataset.framePlaceholder === "true") {
+      holder.innerHTML = cameras.length ? `<div class="camera-grid ${cameras.length === 1 ? "single" : ""}">${cameras.map((camera,index) => `<div class="camera"><span class="camera-label">${esc(camera)}</span><div id="live-camera-slot-${index}" class="collection-frame-slot"><span>관측 수신 대기</span></div></div>`).join("")}</div>` : '<div class="live-placeholder"><p>카메라 관측을 기다리고 있습니다.</p></div>';
+      holder.dataset.framePlaceholder = "false";
+      view = {holder,projectId:project.id,runId,routeToken:state.routeToken,cameraSignature:signature,
+        slots:cameras.map((camera,index) => ({camera,element:$("live-camera-slot-"+index),pending:null,observationId:null,displayed:false,failed:false}))};
+      state.collectionFrames = view;
+    }
+    const currentSource = () => state.collectionFrames === view && state.route.tab === "collection"
+      && state.routeToken === view.routeToken && $("live-images") === holder && state.route.id === view.projectId
+      && state.status?.active_project_id === view.projectId && (state.status?.run_id || null) === view.runId;
+    const updateFooter = () => {
+      if (!currentSource()) return;
+      footer.textContent = view.slots.some(slot => slot.failed) ? "이미지 갱신 재시도 중 · 마지막 수집 화면을 유지합니다."
+        : `상태 관측 ${date(state.status?.observation?.timestamp,{second:"2-digit"})} · 카메라는 같은 ${view.runId ? "run" : "환경"}의 최신 화면입니다.`;
+    };
+    view.slots.forEach((slot,index) => {
+      // Keep one request per camera in flight. Faster status polls must not starve a slow image.
+      if (slot.pending || slot.observationId === observationId) return;
+      const frame = new Image();
+      frame.id = "live-camera-"+index;frame.alt = `${slot.camera} 현재 관측`;
+      slot.pending = frame;
+      frame.onload = () => {
+        if (slot.pending !== frame) return;
+        slot.pending = null;
+        if (!currentSource() || !state.connected || state.status?.phase === "initializing") return;
+        slot.element.replaceChildren(frame);
+        slot.observationId = observationId;slot.displayed = true;slot.failed = false;
+        updateFooter();
+      };
+      frame.onerror = () => {
+        if (slot.pending !== frame) return;
+        slot.pending = null;slot.failed = true;
+        // Do not replace the displayed image with a broken image; retry even while paused.
+        updateFooter();
+      };
+      // The runner advances between status and JPEG requests. Scope to the owner/run,
+      // using the observation ID only to bypass caches, rather than requiring an exact tick.
+      frame.src = `/api/frame/${encodeURIComponent(slot.camera)}?project_id=${encodeURIComponent(view.projectId)}${view.runId ? `&run_id=${encodeURIComponent(view.runId)}` : ""}&t=${encodeURIComponent(observationId)}`;
+    });
+    updateFooter();
+  }
+
   function renderCollection(project) {
-    state.lastObservation = null;state.lastCameras = "";state.lastEvents = "";
+    if (remoteRobotProject(project)) {renderRemoteRobotConnection(project);return;}
+    state.lastObservation = null;state.lastCameras = "";state.lastEvents = "";state.collectionFrames = null;
     $("tab-content").innerHTML = `${renderCollectionSettings(project)}<div class="collection-layout"><div><section class="panel"><div class="panel-header"><div><h2>실시간 수집</h2><p id="live-subtitle">환경을 연결한 뒤 관측을 확인하세요.</p></div><span id="live-state" class="tag neutral">준비 전</span></div><div id="live-images"><div class="live-placeholder">${icon("camera")}<h3>수집 환경을 연결하세요</h3><p>환경 연결 후 현재 카메라를 확인할 수 있습니다.<br>수집 시작을 누르기 전까지 GPT는 호출되지 않습니다.</p></div></div><div id="observation-footer" class="observation-footer"><span>카메라 대기 중</span><span>현재 프로젝트의 관측만 표시합니다.</span></div><div class="execution-meta"><div><span>현재 단계</span><strong id="live-stage">—</strong></div><div><span>Task / Reset step</span><strong id="live-steps">0 / 0</strong></div><div><span>실행 API 비용</span><strong id="live-cost">—</strong></div></div><div class="collection-record-link">${icon("database")}<span>GPT 판단 요약과 action 기록은 <a href="${routeUrl(project.id,"data")}">데이터 → Episode 상세</a>에서 확인하세요.</span></div></section><section class="panel events-panel"><div class="panel-header"><h2>실행 이벤트</h2><span id="events-count" class="tag neutral">0</span></div><ol id="events-list" class="events-list"><li class="empty-event">이 프로젝트의 실행 이벤트가 여기에 표시됩니다.</li></ol></section></div><aside class="panel control-panel"><div class="panel-header"><h2>수집 제어</h2><a class="icon-button" href="#collection-settings-panel" aria-label="수집 실행 설정" data-action="collection-settings-focus">${icon("settings")}</a></div><div class="panel-body"><section class="control-section"><span class="control-label">01 · 환경 연결</span><button id="initialize-project" class="button secondary full" data-action="connect" disabled>${icon("robot")}환경 연결</button><p id="initialize-note" class="control-note">환경 관측만 연결합니다. Run 생성과 GPT 호출은 수집 시작 시 수행합니다.</p></section><section class="control-section"><span class="control-label">02 · 데이터 수집</span><button id="start-collection" class="button primary full" data-action="start" disabled>${icon("play")}수집 시작</button><div class="control-row"><button id="pause-collection" class="button pause" data-action="pause" disabled>${icon("pause")}Pause</button><button id="step-collection" class="button secondary" data-action="step" disabled>${icon("step")}한 번만 실행</button></div><button id="stop-collection" class="button danger full" data-action="stop" style="margin-top:9px" disabled>${icon("stop")}수집 중지</button><p id="control-note" class="control-note">환경을 먼저 연결해주세요.</p></section><section class="control-section"><dl class="session-rows"><div><dt id="live-goal-label">실행 목표</dt><dd id="live-goal">${n(project.run_config?.episodes) || 1} episodes / run</dd></div><div id="next-goal-row" hidden><dt>다음 run 목표</dt><dd id="next-goal">—</dd></div><div><dt>Reset</dt><dd id="live-reset-mode">${esc(resetModeLabel(project.run_config?.reset_mode))}</dd></div><div><dt>비용 한도</dt><dd id="live-budget">${money(project.run_config?.budget_usd)}</dd></div><div><dt>Teacher</dt><dd id="teacher-name">—</dd></div><div><dt>Reasoning</dt><dd id="teacher-effort">—</dd></div><div id="next-policy-row" hidden><dt>다음 모델 설정</dt><dd id="next-policy">—</dd></div><div><dt>입력 / 출력 tokens</dt><dd id="live-tokens">—</dd></div><div><dt>Run</dt><dd id="live-run">—</dd></div></dl></section></div></aside></div>`;
     updateCollection();
     refreshPipeline(true);
   }
 
   function updateCollection() {
+    if (state.route.tab === "collection" && remoteRobotProject()) {updateRemoteRobotConnection();updateRemotePolicyPanel();return;}
     if (state.route.tab !== "collection" || !$("initialize-project")) return;
     const s = state.status || {}, p = currentProject();
     if (!p) return;
@@ -1395,25 +2136,7 @@
     $("next-policy").textContent = policyLabel(selectedPolicy);
     $("live-tokens").textContent = own ? `${count(s.stats?.input_tokens)} / ${count(s.stats?.output_tokens)}` : "—";
     $("live-run").textContent = own ? s.run_id || "—" : "—";
-    const observation = own ? s.observation : null;
-    if (observation) {
-      const cameras = (Array.isArray(observation.cameras) ? observation.cameras.map(x => typeof x === "string" ? x : x.name) : Object.keys(observation.cameras || {})).filter(name => typeof name === "string" && name && !/^reset_reference(?:_|$)/.test(name));
-      const signature = cameras.join("|");
-      if (signature !== state.lastCameras) {
-        $("live-images").innerHTML = `<div class="camera-grid ${cameras.length === 1 ? "single" : ""}">${cameras.map((camera,index) => `<div class="camera"><span class="camera-label">${esc(camera)}</span><img id="live-camera-${index}" alt="${esc(camera)} 현재 관측"></div>`).join("")}</div>`;
-        state.lastCameras = signature;
-        state.lastObservation = null;
-      }
-      if (observation.id !== state.lastObservation) {
-        cameras.forEach((camera,index) => {$("live-camera-"+index).src = `/api/frame/${encodeURIComponent(camera)}?observation_id=${encodeURIComponent(observation.id)}`;});
-        state.lastObservation = observation.id;
-      }
-      $("observation-footer").innerHTML = `<span>마지막 관측 ${esc(date(observation.timestamp,{second:"2-digit"}))}</span><span>관측 ID ${esc(String(observation.id).split(":").slice(-2).join(":"))}</span>`;
-    } else if (state.lastObservation !== null || state.lastCameras) {
-      $("live-images").innerHTML = `<div class="live-placeholder">${icon("camera")}<h3>수집 환경을 연결하세요</h3><p>현재 프로젝트에 연결된 실시간 관측이 없습니다.<br>환경 연결 후 카메라를 확인할 수 있습니다.</p></div>`;
-      $("observation-footer").innerHTML = "<span>카메라 대기 중</span><span>현재 프로젝트의 관측만 표시합니다.</span>";
-      state.lastObservation = null;state.lastCameras = "";
-    }
+    updateCollectionFrames();
     const events = own ? (s.events || []).filter(event => (!event.run_id || event.run_id === s.run_id) && ["ready","episode_start","episode","reset","budget","control","error"].includes(event.kind) && !/Discarded a response/.test(event.message || "")) : [];
     const eventSignature = JSON.stringify(events.map(x => x.id));
     if (eventSignature !== state.lastEvents) {
@@ -1457,12 +2180,12 @@
     state.workspaceBusy = true;
     try {
       const data = await api("/api/workspace");
-      const signature = JSON.stringify([data.projects,data.totals]);
+      const signature = JSON.stringify([data.projects,data.archived_projects,data.totals]);
       const changed = signature !== state.workspaceSignature;
       state.workspace = data;state.workspaceSignature = signature;
       renderNav();renderGlobal();
       if (!state.route.id && (changed || force) && document.activeElement?.id !== "project-search") renderHome();
-      if (state.route.id && (force || !["settings","collection","models","evaluation"].includes(state.route.tab))) await loadDetail(false);
+      if (state.route.id && (force || !["collection","models","evaluation"].includes(state.route.tab))) await loadDetail(false);
       $("freshness").textContent = `최근 동기화 ${new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit",hour12:false})}`;
       if (state.connected) showError(null);
     } catch (error) { if (!state.workspace || force) showError(error.message); }
@@ -1497,6 +2220,7 @@
       state.detail = detail;state.detailSignature = signature;
       if (force || changed && !["settings","collection","models","evaluation"].includes(state.route.tab)) renderProject();
       else if (state.route.tab === "collection") updateCollection();
+      else if (state.route.tab === "settings") updateProjectManagement();
       else if (["models","evaluation"].includes(state.route.tab)) updatePipelineView();
       if (state.route.tab === "overview") refreshPipeline();
       if (state.episodeDetail && $("episode-dialog").open) refreshEpisodeVideoJob();
@@ -1508,6 +2232,7 @@
   }
 
   async function navigate() {
+    stopRobotConnectionPolling();stopRemotePolicyPolling();
     const pieces = location.hash.replace(/^#\/?/,"").split("/");
     let id = null;
     try { id = pieces[0] === "projects" && pieces[1] ? decodeURIComponent(pieces[1]) : null; } catch { id = null; }
@@ -1531,6 +2256,7 @@
   }
 
   async function command(action, global = false) {
+    if (!global && remoteRobotProject()) {toast(remoteConnectionOnlyReason,true);return;}
     if (action === "pause" ? state.pausePending : state.pending || state.pausePending) return;
     const id = global ? activeId() : state.route.id;
     const unownedPause = action === "pause" && (global && !id || state.pending === "connect" && state.pendingProjectId === id && activeId() !== id);
@@ -1561,70 +2287,88 @@
     return text.replaceAll("_"," ").slice(0,85);
   }
 
+  function selectedCreateBackend() {
+    return $("create-backend").value;
+  }
+
   function updateCreateTask() {
-    const task = state.tasks.find(x => String(x.id) === $("create-task").value);
+    const backend = selectedCreateBackend(), remote = backend === "remote_robot";
+    const task = remote ? {name:$("create-remote-task").value.trim() || "로봇 PC 연결"} : state.tasks.find(x => String(x.id) === $("create-task").value);
     const name = $("create-name");
     if (!name.value || name.dataset.auto === "true") {
-      name.value = `[${(state.workspace?.runtime.backend || "libero").toUpperCase()}] ${shortTask(task)}`;
-      name.dataset.auto = "true";
+      name.value = `[${remote ? "SSH" : backend.toUpperCase()}] ${shortTask(task)}`;name.dataset.auto = "true";
     }
-    $("task-help").textContent = task?.agent_reset_supported === false ? "이 task에는 독립 GPT reset 검증이 아직 없습니다. 실행하려면 지원 task를 선택하거나 설정에서 환경 초기화 모드를 명시적으로 선택하세요." : "프로젝트를 만들어도 환경이나 모델은 실행되지 않습니다.";
+    $("task-help").textContent = task?.agent_reset_supported === false ? "이 task에는 독립 GPT reset 검증이 아직 없습니다. 실행하려면 지원 task를 선택하거나 수집 설정에서 환경 초기화 모드를 명시적으로 선택하세요." : "프로젝트를 만들어도 환경이나 모델은 실행되지 않습니다.";
+  }
+
+  function updateCreateBackend() {
+    const backend = selectedCreateBackend(), remote = backend === "remote_robot";
+    state.taskToken += 1;state.tasks = [];$("create-error").hidden = true;
+    $("create-suite-field").hidden = remote || !backend;$("create-suite").disabled = remote || backend !== "libero";
+    $("create-catalog-task-field").hidden = remote || !backend;$("create-task").disabled = remote || !backend;
+    $("create-remote-task-field").hidden = !remote;$("create-remote-task").disabled = !remote;$("create-remote-task").required = remote;
+    $("create-goal-fields").hidden = remote || !backend;
+    $("create-goal-fields").querySelectorAll("input").forEach(input => {input.disabled = remote || !backend;});
+    if (!backend) {$("create-submit").disabled = true;return;}
+    if (remote) {$("create-submit").disabled = Boolean(state.createBusy);updateCreateTask();}
+    else loadTasks();
   }
 
   async function loadTasks() {
-    const token = ++state.taskToken;
-    const backend = state.workspace?.runtime.backend || "libero";
+    const token = ++state.taskToken, backend = selectedCreateBackend();
+    if (!backend) return;
+    if (backend === "remote_robot") {state.tasks = [];updateCreateTask();return;}
     $("create-task").disabled = true;$("create-submit").disabled = true;
-    $("create-task").innerHTML = '<option value="">Task를 불러오는 중…</option>';
-    $("create-error").hidden = true;
+    $("create-task").innerHTML = '<option value="">Task를 불러오는 중…</option>';$("create-error").hidden = true;
     try {
       const data = await api(`/api/tasks${backend === "libero" ? `?suite=${encodeURIComponent($("create-suite").value)}` : ""}`,undefined,30000);
-      if (token !== state.taskToken) return;
+      if (token !== state.taskToken || selectedCreateBackend() !== backend || !$("create-dialog").open) return;
       state.tasks = data.tasks || [];
       $("create-task").innerHTML = state.tasks.map(task => `<option value="${n(task.id)}">${n(task.id)} · ${esc(task.language || task.name || "Task")}</option>`).join("");
       const selectedId = n(state.status?.config?.task_id);
       if (state.tasks.some(task => task.id === selectedId)) $("create-task").value = String(selectedId);
-      $("create-task").disabled = !state.tasks.length;$("create-submit").disabled = !state.tasks.length;
+      $("create-task").disabled = !state.tasks.length;$("create-submit").disabled = !state.tasks.length || Boolean(state.createBusy);
       if (!state.tasks.length) throw new Error("사용 가능한 task가 없습니다.");
       updateCreateTask();
     } catch (error) {
-      if (token !== state.taskToken) return;
+      if (token !== state.taskToken || selectedCreateBackend() !== backend || !$("create-dialog").open) return;
       $("create-task").innerHTML = '<option value="">Task를 불러오지 못했습니다</option>';
       $("create-error").textContent = error.message;$("create-error").hidden = false;
     }
   }
 
   function openCreate() {
-    if (!state.workspace) return;
+    if (!state.workspace || state.createBusy) return;
     $("create-form").reset();$("create-error").hidden = true;$("create-name").dataset.auto = "true";
     const backend = state.workspace.runtime.backend || "libero", suite = state.workspace.runtime.suite || "libero_90";
-    $("create-backend").value = backend.toUpperCase();$("create-suite").disabled = backend !== "libero";
-    if (![...$("create-suite").options].some(o => o.value === suite)) $("create-suite").add(new Option(suite,suite));
-    $("create-suite").value = suite;
-    $("create-dialog").showModal();
-    loadTasks();
+    $("create-backend").innerHTML = `<option value="" disabled selected>환경을 선택하세요</option>${backend === "remote_robot" ? "" : `<option value="${esc(backend)}">${esc(backendLabel(backend))}</option>`}<option value="remote_robot">원격 로봇</option>`;
+    $("create-backend").value = "";
+    if (![...$("create-suite").options].some(option => option.value === suite)) $("create-suite").add(new Option(suite,suite));
+    $("create-suite").value = suite;$("create-dialog").showModal();updateCreateBackend();
   }
 
   async function createProject(event) {
-    event.preventDefault();
-    const form = event.currentTarget;
-    if (!form.reportValidity()) return;
-    const data = new FormData(form), task = state.tasks.find(x => String(x.id) === data.get("task_id"));
-    if (!task) return;
-    const payload = {name:String(data.get("name")).trim(),description:String(data.get("description") || "").trim(),backend:state.workspace.runtime.backend,suite:$("create-suite").value,task_id:task.id,task_name:task.language || task.name,pipeline:{demo_target:Number(data.get("demo_target")),bc_success_target:Number(data.get("bc_success_target")),rl_success_target:Number(data.get("rl_success_target"))}};
-    $("create-submit").disabled = true;$("create-error").hidden = true;
+    event.preventDefault();const form = event.currentTarget;
+    if (state.createBusy || !form.reportValidity()) return;
+    const backend = selectedCreateBackend(), remote = backend === "remote_robot", runtimeBackend = state.workspace?.runtime.backend || "libero";
+    if (backend !== runtimeBackend && !remote) return;
+    const data = new FormData(form), task = remote ? {id:0,name:String(data.get("remote_task_name") || "").trim()} : state.tasks.find(item => String(item.id) === data.get("task_id"));
+    if (!task || remote && !task.name) return;
+    const payload = {name:String(data.get("name")).trim(),description:String(data.get("description") || "").trim(),backend,suite:remote ? "custom" : $("create-suite").value,task_id:task.id,task_name:task.language || task.name};
+    if (!remote) payload.pipeline = {demo_target:Number(data.get("demo_target")),bc_success_target:Number(data.get("bc_success_target")),rl_success_target:Number(data.get("rl_success_target"))};
+    state.createBusy = true;$("create-submit").disabled = true;$("create-backend").disabled = true;$("create-error").hidden = true;
     try {
       const result = await api("/api/projects",payload);
-      $("create-dialog").close();toast("프로젝트를 만들었습니다. 수집은 아직 시작되지 않았습니다.");
-      await refreshWorkspace();location.hash = routeUrl(result.project.id);
+      $("create-dialog").close();toast(remote ? "원격 로봇 프로젝트를 만들었습니다. 환경 연결 탭에서 SSH와 client를 설정하세요." : "프로젝트를 만들었습니다. 수집은 아직 시작되지 않았습니다.");
+      await refreshWorkspace();location.hash = routeUrl(result.project.id,remote ? "collection" : "overview");
     } catch (error) {$("create-error").textContent = error.message;$("create-error").hidden = false;}
-    finally {$("create-submit").disabled = false;}
+    finally {state.createBusy = false;$("create-submit").disabled = false;$("create-backend").disabled = false;}
   }
 
   async function saveSettings(event) {
     event.preventDefault();
     const form = event.target, project = currentProject(), routeToken = state.routeToken;
-    if (!project || !form.reportValidity()) return;
+    if (!project || state.projectMutation || state.settingsSaving || project.delete_pending || !form.reportValidity()) return;
     const data = new FormData(form);
     const payload = {name:String(data.get("name")).trim(),description:String(data.get("description") || "").trim()};
     const graspInput = form.elements.expected_grasp_closures;
@@ -1637,7 +2381,7 @@
     if ((policyOptions().models || []).some(item => item.model === data.get("policy_model"))) {
       payload.policy_config = {model:String(data.get("policy_model")),reasoning_effort:String(data.get("reasoning_effort"))};
     }
-    $("settings-save").disabled = true;$("settings-error").hidden = true;
+    state.settingsSaving = true;updateProjectManagement();$("settings-error").hidden = true;
     try {
       const result = await api(`/api/projects/${encodeURIComponent(project.id)}/settings`,payload);
       const stillHere = routeToken === state.routeToken && currentProject()?.id === project.id;
@@ -1646,7 +2390,7 @@
         const panel = document.querySelector(".grasp-baseline-panel");
         if (panel) panel.outerHTML = graspBaselinePanel(result.project);
       }
-      toast("설정을 저장했습니다. 환경 재연결 없이 다음 새 run부터 적용됩니다. Pause·재개는 현재 run의 설정을 유지합니다.");
+      toast("설정을 저장했습니다. 다음 새 run부터 적용되며 Pause·재개는 현재 run의 설정을 유지합니다.");
       await refreshWorkspace();await refreshStatus(true);renderNav();renderBreadcrumb();
       if (routeToken === state.routeToken && currentProject()?.id === project.id) {
         const heading = document.querySelector(".project-heading h1");if (heading) heading.textContent = result.project.name;
@@ -1655,7 +2399,7 @@
       if (routeToken === state.routeToken && $("settings-error")) {$("settings-error").textContent = error.message;$("settings-error").hidden = false;}
       else toast(error.message,true);
     }
-    finally { if (routeToken === state.routeToken && $("settings-save")) $("settings-save").disabled = false; }
+    finally {state.settingsSaving = false;if (routeToken === state.routeToken) updateProjectManagement();}
   }
 
   async function manageEpisode(run, id, archived) {
@@ -1796,7 +2540,7 @@
     const close = event.target.closest("[data-close-dialog]");
     if (close) {
       const dialog = close.closest("dialog");
-      if (!(dialog.id === "delete-dialog" && state.deleteBusy) && !(dialog.id === "bulk-episode-dialog" && state.bulkEpisodeBusy)) dialog.close();
+      if (!(dialog.id === "delete-dialog" && state.deleteBusy) && !(dialog.id === "bulk-episode-dialog" && state.bulkEpisodeBusy) && !(dialog.id === "project-delete-dialog" && state.projectMutation)) dialog.close();
       return;
     }
     if (event.target.closest(".episode-select-cell")) {event.stopPropagation();return;}
@@ -1805,6 +2549,24 @@
     if (button.closest(".episode-clickable-row") && button.tagName === "BUTTON") event.stopPropagation();
     const action = button.dataset.action;
     if (action === "create") openCreate();
+    else if (action === "projects-active" || action === "projects-archived") {state.projectView = action === "projects-archived" ? "archived" : "active";renderHome();}
+    else if (action === "archive-project") archiveProject(true);
+    else if (action === "restore-project") archiveProject(false);
+    else if (action === "delete-project") askDeleteProject();
+    else if (action === "confirm-delete-project") deleteProject();
+    else if (action === "remote-environment-connect") remoteEnvironmentCommand("environment/connect");
+    else if (action === "remote-environment-disconnect") remoteEnvironmentCommand("environment/disconnect");
+    else if (action === "remote-token-issue") requestRemoteToken();
+    else if (action === "remote-token-confirm") remotePolicyCommand("token");
+    else if (action === "remote-config-download") downloadRemoteConfig();
+    else if (action === "remote-status-refresh") refreshRemotePolicy();
+    else if (action === "remote-run-once") remotePolicyCommand("start",null,true);
+    else if (["remote-run-pause","remote-run-resume","remote-run-stop"].includes(action)) remotePolicyCommand(action.replace("remote-run-",""));
+    else if (action === "robot-connect") robotConnectionCommand("connect");
+    else if (action === "robot-disconnect") robotConnectionCommand("disconnect");
+    else if (action === "robot-status-refresh") refreshRobotConnection();
+    else if (action === "robot-host-key-check") checkRobotHostKey();
+    else if (action === "robot-host-key-trust") trustRobotHostKey();
     else if (action === "refresh") {refreshStatus();refreshWorkspace(true);}
     else if (action === "generate-episode-video") mutateEpisodeVideo("generate");
     else if (action === "delete-episode-video") mutateEpisodeVideo("delete");
@@ -1840,13 +2602,22 @@
     event.preventDefault();openEpisode(row.dataset.run,row.dataset.episode);
   });
   document.addEventListener("input", event => {
-    if (event.target.id === "bc-history-point-range") updateBCHistoryPoint(Number(event.target.value));
+    if (event.target.dataset?.robotConfig) editRobotConnectionField(event.target);
+    if (event.target.closest("#remote-run-form")) editRemoteRunField(event.target);
+    if (event.target.closest("#remote-launch-form")) editRemoteLaunchField(event.target);
+    if (event.target.id === "remote-server-url" && remotePolicyIsCurrent()) {state.remotePolicy.baseUrl = event.target.value;state.remotePolicy.baseUrlDirty = true;updateRemotePolicyPanel();}
+    if (event.target.id === "create-remote-task") updateCreateTask();
     if (event.target.id === "project-search") {state.search = event.target.value;renderProjectCards();}
     if (event.target.id === "create-name") event.target.dataset.auto = "false";
     if (event.target.closest("#collection-settings-form")) state.collectionSettingsDirty = true;
     if (event.target.closest("#pipeline-start-form")) updatePipelineStartPreview();
   });
   document.addEventListener("change", event => {
+    if (event.target.dataset?.robotConfig) editRobotConnectionField(event.target);
+    if (event.target.closest("#remote-run-form")) editRemoteRunField(event.target);
+    if (event.target.closest("#remote-launch-form")) editRemoteLaunchField(event.target);
+    if (event.target.id === "remote-server-url" && remotePolicyIsCurrent()) {state.remotePolicy.baseUrl = event.target.value;state.remotePolicy.baseUrlDirty = true;updateRemotePolicyPanel();}
+    if (event.target.id === "create-backend") updateCreateBackend();
     if (event.target.id === "create-suite") loadTasks();
     if (event.target.id === "create-task") updateCreateTask();
     if (event.target.id === "episode-select-all" || event.target.matches("input[data-episode-select]")) toggleEpisodeSelection(event.target);
@@ -1857,6 +2628,9 @@
     if (event.target.dataset.trainingAlgorithm && ["bc","rl"].includes(event.target.dataset.trainingAlgorithm)) {state.trainingAlgorithms[event.target.dataset.trainingAlgorithm] = event.target.value;updatePipelineExecution();}
   });
   document.addEventListener("submit", event => {
+    if (event.target.id === "robot-connection-form") robotConnectionCommand("config",event);
+    if (event.target.id === "remote-run-form") remotePolicyCommand("start",event);
+    if (event.target.id === "remote-launch-form") remoteEnvironmentCommand("launch-config",event);
     if (event.target.id === "settings-form") saveSettings(event);
     if (event.target.id === "stage-start-form") submitStageStart(event);
     if (event.target.id === "pipeline-start-form") submitPipelineStart(event);
@@ -1865,13 +2639,17 @@
   $("pipeline-start-dialog").addEventListener("close", () => {state.pipelineDialog = null;});
   $("stage-start-dialog").addEventListener("close", () => {state.stageDialog = null;});
   $("bc-history-dialog").addEventListener("close",closeBCHistory);
+  $("robot-host-key-dialog").addEventListener("close", () => {state.robotHostKey = null;});
   document.addEventListener("pointermove",inspectBCHistoryPointer);
   document.addEventListener("pointerdown",inspectBCHistoryPointer);
   $("create-form").addEventListener("submit",createProject);
+  $("create-dialog").addEventListener("close", () => {state.taskToken += 1;});
   $("episode-dialog").addEventListener("close", () => {const video = $("episode-content").querySelector("video");if (video) video.pause();state.episodeToken += 1;state.episodeDetail = null;});
   $("delete-dialog").addEventListener("cancel", event => {if (state.deleteBusy) event.preventDefault();});
   $("bulk-episode-dialog").addEventListener("cancel", event => {if (state.bulkEpisodeBusy) event.preventDefault();});
   $("bulk-episode-dialog").addEventListener("close", () => {state.bulkEpisodeTarget = null;});
+  $("project-delete-dialog").addEventListener("cancel", event => {if (state.projectMutation) event.preventDefault();});
+  $("project-delete-dialog").addEventListener("close", () => {state.projectDeleteTarget = null;});
   window.addEventListener("hashchange",navigate);
   fillIcons();
   navigate();

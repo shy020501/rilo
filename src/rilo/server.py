@@ -12,13 +12,17 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from rilo.config import Settings
+from rilo.config import Settings, REMOTE_ROBOT_BACKEND, REMOTE_ROBOT_CONNECTION_ONLY_REASON
 from rilo.projects import CAPABILITIES, ProjectCreate, ProjectSettings, ProjectStore, empty_stats
 from rilo.policy_settings import PolicyConfig, policy_catalog
 from rilo.recording import dump_json
 from rilo.runner import Runner, RunConfig, StateConflict
 from rilo.pipeline import PipelineEngine, PipelineStart
 from rilo.video_jobs import create_video_router
+from rilo.robot_connections import create_robot_connection_router
+from rilo.remote.api import RemoteAPI, create_rpc_app
+from rilo.remote.listener import PolicyRPCListener
+from rilo.remote.service import RemoteError, RemoteService
 
 
 class InitializeProject(BaseModel):
@@ -52,10 +56,14 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
 
     @asynccontextmanager
     async def lifespan(app):
-        yield
-        await video_jobs.close()
-        await pipeline.close()
-        await controller.close()
+        try:
+            yield
+        finally:
+            await remote_api.close()
+            await robot_connections.close()
+            await video_jobs.close()
+            await pipeline.close()
+            await controller.close()
 
     app = FastAPI(title="RILO", lifespan=lifespan)
     app.state.runner = controller
@@ -87,6 +95,10 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
     async def state_error(request, exc):
         return Response(dump_json({"detail": str(exc)}), status_code=409, media_type="application/json")
 
+    @app.exception_handler(RemoteError)
+    async def remote_error(request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+
     def snapshot():
         status = controller.status()
         if active_project_id and controller.recorder and status.get("episode", {}).get("id"):
@@ -100,6 +112,7 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
                                    "pipeline_runtime": pipeline.runtime()}), media_type="application/json")
 
     def require_manual_control():
+        require_execution_available(active_project_id)
         if pipeline.active:
             raise StateConflict("파이프라인이 실행 권한을 사용 중입니다. 파이프라인 제어에서 Pause/중지를 사용하세요.")
 
@@ -117,8 +130,15 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
     def project_policy(project):
         return project.get("policy_config") or policy_options()["defaults"]
 
-    def execution_management_reason(run_id):
-        if pipeline.active and run_id in projects.get(pipeline.runtime()["project_id"])["run_ids"]:
+    def execution_management_reason(run_id, *, ignore_pending_project=None):
+        if any(project.get("delete_pending") and project["id"] != ignore_pending_project
+               and run_id in project["run_ids"]
+               for project in projects._load()["projects"]):
+            return "프로젝트를 삭제 중입니다. 데이터 작업을 시작할 수 없습니다."
+        if remote_service.owns_run(run_id):
+            return "현재 로봇 실행에 속한 데이터입니다. run을 중지한 뒤 변경하세요."
+        pipeline_owner = (pipeline.runtime() or {}).get("project_id")
+        if pipeline.active and (pipeline_owner is None or run_id in projects.get(pipeline_owner)["run_ids"]):
             return "이 프로젝트의 학습/평가가 실행 중입니다. 파이프라인을 중지한 뒤 데이터를 변경하세요."
         # A retired provider request can still append its usage to an older run.
         # Until it settles, avoid destructive changes to any associated files.
@@ -134,10 +154,10 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
                 return "GPT 요청이 아직 종료되지 않았습니다. 잠시 후 다시 시도하세요."
         return None
 
-    def management_reason(run_id):
+    def management_reason(run_id, *, ignore_pending_project=None):
         if video_jobs.is_busy(run_id):
             return "영상 생성 중입니다. 완료된 뒤 데이터를 변경하세요."
-        return execution_management_reason(run_id)
+        return execution_management_reason(run_id, ignore_pending_project=ignore_pending_project)
 
     def episode_controls(episode):
         reason = management_reason(episode["run_id"])
@@ -149,24 +169,83 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
         except KeyError:
             raise HTTPException(404, "Project does not exist") from None
 
+    def require_execution_available(project_id=None):
+        if remote_service.active:
+            raise StateConflict("원격 로봇 run이 진행 중입니다. 먼저 해당 run을 중지하세요.")
+        if project_id is not None:
+            project = get_project(project_id)
+            if project.get("archived") or project.get("delete_pending"):
+                raise StateConflict("보관된 프로젝트를 복원한 뒤 실행하세요.")
+        if (settings.backend == REMOTE_ROBOT_BACKEND or project_id is not None
+                and get_project(project_id)["backend"] == REMOTE_ROBOT_BACKEND):
+            raise StateConflict(REMOTE_ROBOT_CONNECTION_ONLY_REASON)
+
     def availability(project):
+        if project.get("archived") or project.get("delete_pending"):
+            reason = "삭제를 마무리하거나 보관된 프로젝트를 복원한 뒤 실행하세요."
+            return {"runnable": False, "connectable": False,
+                    "connection_only": project["backend"] == REMOTE_ROBOT_BACKEND,
+                    "runnable_reason": reason, "unavailable_reason": reason}
+        if project["backend"] == REMOTE_ROBOT_BACKEND:
+            return {"runnable": False, "connectable": True, "connection_only": True,
+                    "runnable_reason": REMOTE_ROBOT_CONNECTION_ONLY_REASON,
+                    "unavailable_reason": REMOTE_ROBOT_CONNECTION_ONLY_REASON}
         reason = None
         if project["backend"] != settings.backend:
             reason = f"This server uses {settings.backend}; launch a server configured for {project['backend']} to collect this project."
         return {"runnable": reason is None, "runnable_reason": reason, "unavailable_reason": reason}
+
+    def project_management_reason(project):
+        project_id = project["id"]
+        pipeline_owner = (pipeline.runtime() or {}).get("project_id")
+        if (pipeline._starting_project == project_id
+                or pipeline.active and pipeline_owner in (None, project_id)):
+            return "이 프로젝트의 학습·평가를 중지한 뒤 프로젝트를 관리하세요."
+        for run_id in project["run_ids"]:
+            reason = management_reason(run_id, ignore_pending_project=project_id)
+            if reason:
+                return reason
+        if (active_project_id == project_id
+                and controller.phase in ("initializing", "ready", "thinking", "executing", "pausing", "paused")):
+            return "현재 수집을 중지한 뒤 프로젝트를 관리하세요."
+        if project["backend"] == REMOTE_ROBOT_BACKEND:
+            session = remote_service.sessions.get(project_id)
+            if session and (session.connected or session.run and session.run["status"] in
+                            ("preparing", "running", "pausing", "paused", "stopping")):
+                return "로봇 run을 중지하고 환경 연결을 해제한 뒤 프로젝트를 관리하세요."
+            if project_id in remote_api.jobs or project_id in remote_api.disconnecting:
+                return "환경 연결·해제가 끝난 뒤 프로젝트를 관리하세요."
+            launcher = remote_api.launcher.snapshot(project_id).get("active_launcher")
+            connection = robot_connections.snapshot(project_id).get("active_connection")
+            if any(item and item["project_id"] == project_id for item in (launcher, connection)):
+                return "SSH·로봇 client 연결을 해제한 뒤 프로젝트를 관리하세요."
+        return None
+
+    def project_management(project):
+        reason = project_management_reason(project)
+        return {"archived": bool(project.get("archived")), "archived_at": project.get("archived_at"),
+                "delete_pending": bool(project.get("delete_pending")),
+                "can_archive": reason is None and not project.get("delete_pending"),
+                "can_delete": reason is None, "manage_disabled_reason": reason}
 
     def project_detail(project_id):
         result = projects.details(get_project(project_id))
         status = availability(result["project"])
         result["project"].update(status)
         result["project"]["policy_config"] = project_policy(result["project"])
+        result["project"].update(project_management(result["project"]))
+        result["project"]["pipeline"] = {**result["project"].get("pipeline", {}),
+                                          **pipeline.project_goals(project_id)}
         result["episodes"] = [episode_controls(ep) for ep in result["episodes"]]
         result["archived_episodes"] = [episode_controls(ep) for ep in result["archived_episodes"]]
-        return {**result, **status, "runtime": runtime(), "capabilities": CAPABILITIES,
+        capabilities = ({**dict.fromkeys(CAPABILITIES, False), "ssh": True}
+                        if status.get("connection_only") else CAPABILITIES)
+        return {**result, **status, "runtime": runtime(), "capabilities": capabilities,
                 "policy_options": policy_options()}
 
     def require_owner(project_id):
         get_project(project_id)
+        require_execution_available(project_id)
         if project_id != active_project_id:
             raise StateConflict("This project does not own the active collection. Connect its environment first.")
 
@@ -192,6 +271,8 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
 
     @app.get("/api/tasks")
     async def tasks(suite: str | None = None):
+        if settings.backend == REMOTE_ROBOT_BACKEND:
+            return {"suite": "custom", "tasks": [], "connection_only": True}
         try:
             selected = suite or controller.settings.suite
             if selected == controller.settings.suite or controller.settings.backend != "libero":
@@ -214,17 +295,23 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
 
     @app.get("/api/workspace")
     async def workspace():
-        cards = []
+        cards, archived_cards = [], []
         totals = {"projects": 0, **empty_stats()}
         for project in projects.list():
             card = projects.details(project)["project"]
             card.update(availability(card))
             card["policy_config"] = project_policy(card)
-            cards.append(card)
-            for key in card["stats"]:
-                totals[key] += card["stats"][key]
+            card.update(project_management(card))
+            card["pipeline"] = {**card.get("pipeline", {}), **pipeline.project_goals(project["id"])}
+            if card["archived"]:
+                archived_cards.append(card)
+            else:
+                cards.append(card)
+                for key in card["stats"]:
+                    totals[key] += card["stats"][key]
         totals["projects"] = len(cards)
-        return {"projects": cards, "totals": totals, "runtime": runtime(), "capabilities": CAPABILITIES,
+        return {"projects": cards, "archived_projects": archived_cards,
+                "totals": totals, "runtime": runtime(), "capabilities": CAPABILITIES,
                 "pipeline_runtime": pipeline.runtime(),
                 "policy_options": policy_options()}
 
@@ -241,10 +328,64 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
     async def project(project_id: str):
         return project_detail(project_id)
 
+    @app.post("/api/projects/{project_id}/archive")
+    async def archive_project(project_id: str, data: ArchiveEpisode):
+        nonlocal active_project_id, connection_only_mode
+        async with ownership_lock:
+            project = get_project(project_id)
+            reason = project_management_reason(project)
+            if reason:
+                raise StateConflict(reason)
+            try:
+                projects.archive(project_id, data.archived)
+            except ValueError as exc:
+                raise HTTPException(409, controller._safe_error(exc)) from None
+            if data.archived and active_project_id == project_id:
+                active_project_id, connection_only_mode = None, False
+            return project_detail(project_id)
+
+    @app.post("/api/projects/{project_id}/delete")
+    async def delete_project(project_id: str, data: DeleteEpisode):
+        nonlocal active_project_id, connection_only_mode
+        if data.confirm is not True:
+            raise HTTPException(400, "Permanent project deletion requires confirm=true")
+        async with ownership_lock:
+            project = get_project(project_id)
+            reason = project_management_reason(project)
+            if reason:
+                raise StateConflict(reason)
+            try:
+                projects.begin_delete(project_id)
+                if project["backend"] == REMOTE_ROBOT_BACKEND:
+                    await remote_api.launcher.forget_project(project_id)
+                    await robot_connections.forget_project(project_id)
+                    remote_service.revoke(project_id)
+                # Completed recorders must not rewrite a deleted run on a later
+                # shutdown. Detaching metadata does not reset the environment.
+                other_runs = {run_id for other in projects.list() if other["id"] != project_id
+                              for run_id in other["run_ids"]}
+                deleted_runs = set(project["run_ids"]) - other_runs
+                if controller.recorder and controller.recorder.run_id in deleted_runs:
+                    controller.recorder.close()
+                    controller.recorder = None
+                if active_project_id == project_id:
+                    active_project_id, connection_only_mode = None, False
+                result = await asyncio.to_thread(projects.delete, project_id)
+                if pipeline._owner == project_id and not pipeline.active:
+                    pipeline._owner = pipeline._state = None
+                return result
+            except (KeyError, FileNotFoundError):
+                raise HTTPException(404, "Project does not exist") from None
+            except ValueError as exc:
+                raise HTTPException(400, controller._safe_error(exc)) from None
+            except OSError:
+                raise HTTPException(500, "프로젝트 삭제가 완료되지 않았습니다. 보관함에서 삭제를 다시 시도하세요.") from None
+
     @app.post("/api/projects/{project_id}/settings")
     async def project_settings(project_id: str, data: ProjectSettings):
         async with ownership_lock:
-            get_project(project_id)
+            if get_project(project_id).get("delete_pending"):
+                raise StateConflict("삭제 중인 프로젝트의 설정은 변경할 수 없습니다.")
             saved = projects.update(project_id, data)
             episode_goal_applied = False
             if (data.run_config is not None and active_project_id == project_id
@@ -337,6 +478,7 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
         async with ownership_lock:
             require_manual_control()
             project = get_project(project_id)
+            require_execution_available(project_id)
             if not availability(project)["runnable"]:
                 raise StateConflict(availability(project)["unavailable_reason"])
             if controller.phase in ("thinking", "executing", "initializing", "pausing", "paused") and controller.status()["run_started"]:
@@ -368,6 +510,7 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
             if not pipeline_owned:
                 require_manual_control()
             project = get_project(project_id)
+            require_execution_available(project_id)
             state = availability(project)
             if not state["runnable"]:
                 raise StateConflict(state["unavailable_reason"])
@@ -432,6 +575,7 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
             return await begin()
 
     async def prepare_manual_run(project_id, *, episodes=None):
+        require_execution_available(project_id)
         project = get_project(project_id)
         config = RunConfig.model_validate({**project["run_config"], "task_id": project["task_id"],
             **({"episodes": episodes} if episodes is not None else {})})
@@ -579,6 +723,7 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
         return {"runs": results}
 
     async def prepare_pipeline_run(project_id, episodes, task_policy, metadata, budget):
+        require_execution_available(project_id)
         project = get_project(project_id)
         is_evaluation = metadata.get("pipeline_stage") in ("bc_eval", "rl_eval")
         frozen = metadata.get("evaluation_config_snapshot", {}) if is_evaluation else {}
@@ -620,6 +765,25 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
     video_router, video_jobs = create_video_router(projects, execution_management_reason)
     app.include_router(video_router)
     app.state.video_jobs = video_jobs
+    robot_router, robot_connections = create_robot_connection_router(settings.data_dir, get_project)
+    app.include_router(robot_router)
+    app.state.robot_connections = robot_connections
+    remote_service = RemoteService(settings, projects, pipeline, execution_busy=lambda:
+        pipeline.active or pipeline._starting_project is not None
+        or controller.phase in ("initializing", "thinking", "executing", "pausing")
+        or bool(controller.phase in ("ready", "paused") and controller.status().get("run_started"))
+        or bool(controller._inference and not controller._inference.done()))
+    remote_api = RemoteAPI(remote_service, robot_connections, ownership_lock=ownership_lock)
+    # The tunnel exposes policy RPC only, never the browser's operator controls.
+    # Its private loopback listener starts lazily with an explicit SSH connect.
+    rpc_listener = PolicyRPCListener(remote_service)
+    robot_connections.forwarding_provider = rpc_listener.ensure
+    remote_api.rpc_listener = rpc_listener
+    app.state.remote_service = remote_service
+    app.state.remote_api = remote_api
+    app.state.remote_rpc_listener = rpc_listener
+    app.include_router(remote_api.router)
+    app.mount("/robot/v1", create_rpc_app(remote_service))
 
     @app.get("/api/projects/{project_id}/pipeline")
     async def pipeline_view(project_id: str):
@@ -649,6 +813,8 @@ def create_app(settings: Settings | None = None, *, runner: Runner | None = None
     async def pipeline_start(project_id: str, data: PipelineStart):
         get_project(project_id)
         async with ownership_lock:
+            if remote_service.active:
+                raise StateConflict("원격 로봇 run을 중지한 뒤 학습·평가를 시작하세요.")
             try:
                 return await pipeline.start(project_id, data)
             except StateConflict:

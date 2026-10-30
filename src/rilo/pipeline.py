@@ -21,7 +21,7 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from rilo.config import make_policy
+from rilo.config import make_policy, REMOTE_ROBOT_BACKEND, REMOTE_ROBOT_CONNECTION_ONLY_REASON
 from rilo.recording import dump_json
 from rilo.runner import StateConflict
 from rilo.pipeline_plan import PipelinePlanner, evaluation_key, evaluation_signature, evaluation_reset_mode
@@ -142,6 +142,13 @@ class PipelineEngine:
             "mode": None, "cycle": 0, "metrics": {}, "stage_metrics": {}, "events": [], "error": None},
             "models": [], "evaluations": []}
 
+    def project_goals(self, project_id):
+        """Display the saved learning targets everywhere without copying them."""
+        config = self._load(project_id)["config"]
+        return {"demo_target": config["collection_episodes"],
+                "bc_success_target": config["bc_success_target"],
+                "rl_success_target": config["rl_success_target"]}
+
     def _save(self):
         folder = self._path(self._owner)
         folder.mkdir(parents=True, exist_ok=True)
@@ -193,6 +200,19 @@ class PipelineEngine:
     def view(self, project_id, *, force=False):
         with self._lock:
             state = self._load(project_id)
+        project = self.projects.get(project_id)
+        if (project["backend"] == REMOTE_ROBOT_BACKEND
+                or self.settings.backend == REMOTE_ROBOT_BACKEND):
+            # A connection preview must not load Torch, inspect datasets, or
+            # advertise a runnable learning job before a robot adapter exists.
+            state.update(connection_only=True,
+                readiness={stage: {"ready": False, "reason": REMOTE_ROBOT_CONNECTION_ONLY_REASON}
+                           for stage in (*STAGES, "auto")},
+                dependencies={"torch": importlib.util.find_spec("torch") is not None, "cuda": False},
+                capabilities={"bc": False, "progress": False, "rl": False, "evaluation": False},
+                algorithm_catalog=algorithm_catalog(), bc_training=None,
+                rl_preparation={"progress_required": True, "progress_model_id": None})
+            return state
         installed = importlib.util.find_spec("torch") is not None
         dependencies = {"torch": installed, "cuda": False}
         if installed:
@@ -245,9 +265,13 @@ class PipelineEngine:
         if state["bc_training"]:
             state["bc_training"]["history_url"] = (
                 f"/api/projects/{project_id}/learning/bc/history?model_id={identity['model_id']}")
+        if project.get("archived") or project.get("delete_pending"):
+            state["readiness"] = {stage: {"ready": False, "reason": "프로젝트를 복원한 뒤 실행하세요."}
+                                  for stage in (*STAGES, "auto")}
         return state
 
     def configure(self, project_id, value):
+        self._require_execution_backend(project_id)
         if self.active and self._owner == project_id or self._starting_project == project_id:
             raise StateConflict("파이프라인을 중지한 뒤 학습 설정을 변경하세요.")
         with self._lock:
@@ -279,6 +303,7 @@ class PipelineEngine:
                 self._starting_project = None
 
     async def _start(self, project_id, request: PipelineStart):
+        self._require_execution_backend(project_id)
         if self.active:
             raise StateConflict("다른 학습/수집 작업이 실행 중입니다. 완료하거나 중지한 뒤 시작하세요.")
         stage = "auto" if request.mode == "auto" else request.stage
@@ -335,7 +360,16 @@ class PipelineEngine:
         self._event("중지 요청 · 현재 학습 update 종료 후 멈춥니다.")
         # Thread cancellation is cooperative. Ownership stays held until it exits.
 
+    def _require_execution_backend(self, project_id):
+        project = self.projects.get(project_id)
+        if project.get("archived") or project.get("delete_pending"):
+            raise StateConflict("프로젝트를 복원한 뒤 실행하세요.")
+        if (self.settings.backend == REMOTE_ROBOT_BACKEND
+                or project["backend"] == REMOTE_ROBOT_BACKEND):
+            raise StateConflict(REMOTE_ROBOT_CONNECTION_ONLY_REASON)
+
     def _require_active(self, project_id):
+        self._require_execution_backend(project_id)
         if not self.active or self._owner != project_id:
             raise StateConflict("이 프로젝트에서 진행 중인 파이프라인이 없습니다.")
 

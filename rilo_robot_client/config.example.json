@@ -1,0 +1,10 @@
+{
+  "base_url": "http://127.0.0.1:45587/robot/v1",
+  "project_token": "REPLACE_WITH_PROJECT_TOKEN",
+  "client_id": "robot-pc-1",
+  "journal_path": "./state/journal.sqlite3",
+  "control_hz": 10,
+  "history_capacity": 64,
+  "request_timeout_seconds": 180,
+  "adapter_options": {}
+}
